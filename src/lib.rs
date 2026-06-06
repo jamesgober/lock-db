@@ -12,23 +12,31 @@
 //!
 //! ## What is in this release
 //!
-//! This is the v0.3.0 milestone. It provides multi-granularity and range
-//! locking on top of the lock-table core:
+//! This is the v0.4.0 milestone, which completes the feature set and freezes the
+//! public API ahead of 1.0. It adds wait-for deadlock detection on top of the
+//! multi-granularity and range locking from earlier releases:
 //!
 //! - [`LockMode`] — the five standard MGL modes (IS, IX, S, SIX, X) and their
 //!   compatibility matrix, plus the lattice [join](LockMode::join) that drives
 //!   upgrades.
-//! - [`LockManager`] — a sharded, non-blocking lock table with acquire,
-//!   release, bulk release, lattice upgrades, and range locks.
+//! - [`LockManager`] — a sharded lock table with acquire, release, bulk release,
+//!   lattice upgrades, range locks, and the deadlock-aware
+//!   [`request`](LockManager::request).
+//! - [`WaitForGraph`] — a wait-for graph with cycle detection and
+//!   [victim selection](VictimPolicy); the manager builds one to detect
+//!   deadlocks, and it is reusable on its own.
 //! - [`KeyRange`] — an inclusive key interval, the unit a range lock protects
 //!   (phantom / predicate protection).
 //! - [`TxnId`] and [`ResourceId`] — opaque identifiers the caller assigns.
 //! - [`LockError`] — the small, exhaustive set of ways an operation can fail.
 //!
-//! Acquisition is non-blocking: a request that cannot be granted returns
-//! [`LockError::Conflict`] instead of waiting. Blocking acquisition with wait
-//! queues and wait-for deadlock detection land in later 0.x releases (see
-//! `dev/ROADMAP.md`).
+//! [`try_acquire`](LockManager::try_acquire) is the non-blocking fast path: a
+//! request that cannot be granted returns [`LockError::Conflict`] and is not
+//! tracked. [`request`](LockManager::request) is the deadlock-aware path: a
+//! request that cannot be granted is recorded in the wait-for graph and reports
+//! [`Acquisition::Waiting`] or, if it closes a cycle,
+//! [`Acquisition::Deadlock`]. lock-db detects deadlocks and names a victim; the
+//! transaction layer above suspends, retries, and aborts.
 //!
 //! ## Hierarchical locking
 //!
@@ -78,6 +86,25 @@
 //! // But a disjoint range is free.
 //! lm.try_acquire_range(TxnId::new(2), index, KeyRange::new(201, 300).unwrap(), LockMode::Exclusive).unwrap();
 //! ```
+//!
+//! Deadlock-aware acquisition, which records waits and reports cycles:
+//!
+//! ```
+//! use lock_db::prelude::*;
+//!
+//! let lm = LockManager::new();
+//! let (a, b) = (ResourceId::new(1), ResourceId::new(2));
+//! let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+//!
+//! lm.request(t1, a, LockMode::Exclusive); // T1 holds A
+//! lm.request(t2, b, LockMode::Exclusive); // T2 holds B
+//! lm.request(t1, b, LockMode::Exclusive); // T1 waits for T2
+//!
+//! // T2 waiting for A closes the cycle; abort the named victim to break it.
+//! if let Acquisition::Deadlock(d) = lm.request(t2, a, LockMode::Exclusive) {
+//!     lm.release_all(d.victim);
+//! }
+//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
@@ -98,6 +125,8 @@ mod mode;
 mod range;
 
 #[cfg(feature = "std")]
+mod deadlock;
+#[cfg(feature = "std")]
 mod manager;
 
 pub use crate::error::LockError;
@@ -106,7 +135,9 @@ pub use crate::mode::LockMode;
 pub use crate::range::KeyRange;
 
 #[cfg(feature = "std")]
-pub use crate::manager::LockManager;
+pub use crate::deadlock::{Deadlock, VictimPolicy, WaitForGraph};
+#[cfg(feature = "std")]
+pub use crate::manager::{Acquisition, LockManager};
 
 /// The crate's common imports.
 ///
@@ -126,5 +157,7 @@ pub mod prelude {
     pub use crate::range::KeyRange;
 
     #[cfg(feature = "std")]
-    pub use crate::manager::LockManager;
+    pub use crate::deadlock::{Deadlock, VictimPolicy, WaitForGraph};
+    #[cfg(feature = "std")]
+    pub use crate::manager::{Acquisition, LockManager};
 }

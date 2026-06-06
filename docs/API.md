@@ -16,10 +16,11 @@
 
 > Complete reference for every public item in `lock-db`, with examples.
 >
-> **Version: 0.3.0.** This release adds multi-granularity locking (the five MGL
-> modes and the hierarchy protocol) and key-range locking on top of the sharded
-> lock-table core. Wait queues and deadlock detection land in later 0.x releases
-> (see [`dev/ROADMAP.md`](../dev/ROADMAP.md)).
+> **Version: 0.4.0 — feature-complete, API frozen.** This release adds wait-for
+> deadlock detection (the deadlock-aware [`request`](#lockmanagerrequest) and the
+> standalone [`WaitForGraph`](#waitforgraph)) on top of the multi-granularity and
+> range locking from earlier releases. The public API is frozen ahead of 1.0;
+> remaining work is hardening (see [`dev/ROADMAP.md`](../dev/ROADMAP.md)).
 
 ## Table of Contents
 
@@ -28,6 +29,7 @@
 - [Quick Start](#quick-start)
 - [Concurrency model](#concurrency-model)
 - [Hierarchical locking](#hierarchical-locking)
+- [Deadlock detection](#deadlock-detection)
 - [Public API](#public-api)
   - [`LockManager`](#lockmanager)
     - [`new`](#lockmanagernew)
@@ -37,10 +39,17 @@
     - [`release_all`](#lockmanagerrelease_all)
     - [`try_acquire_range`](#lockmanagertry_acquire_range)
     - [`release_range`](#lockmanagerrelease_range)
+    - [`request`](#lockmanagerrequest)
+    - [`cancel_wait`](#lockmanagercancel_wait)
+    - [`find_deadlock`](#lockmanagerfind_deadlock)
     - [`holder_count`](#lockmanagerholder_count)
     - [`mode_held`](#lockmanagermode_held)
     - [`range_count`](#lockmanagerrange_count)
+    - [`waiting_count`](#lockmanagerwaiting_count)
     - [`shards`](#lockmanagershards)
+  - [`Acquisition`](#acquisition)
+  - [`WaitForGraph`](#waitforgraph)
+  - [`VictimPolicy` and `Deadlock`](#victimpolicy-and-deadlock)
   - [`LockMode`](#lockmode)
   - [`KeyRange`](#keyrange)
   - [Identifiers](#identifiers)
@@ -67,9 +76,11 @@ types:
 
 | Type | Role |
 |------|------|
-| [`LockManager`](#lockmanager) | The sharded lock table. Point and range locks: acquire, release, query. |
+| [`LockManager`](#lockmanager) | The sharded lock table. Point and range locks, deadlock-aware `request`. |
 | [`LockMode`](#lockmode) | The five MGL modes and their compatibility / lattice rules. |
 | [`KeyRange`](#keyrange) | An inclusive key interval — the unit a range lock protects. |
+| [`WaitForGraph`](#waitforgraph) | Wait-for graph: cycle detection and victim selection. |
+| [`Acquisition`](#acquisition) | The outcome of a deadlock-aware `request`. |
 | [`TxnId`](#identifiers) / [`ResourceId`](#identifiers) | Opaque `u64` identifiers the caller assigns. |
 | [`LockError`](#lockerror) | Why an operation failed. |
 
@@ -79,14 +90,14 @@ types:
 
 ```toml
 [dependencies]
-lock-db = "0.3"
+lock-db = "0.4"
 ```
 
 To enable `serde` derives on the public types:
 
 ```toml
 [dependencies]
-lock-db = { version = "0.3", features = ["serde"] }
+lock-db = { version = "0.4", features = ["serde"] }
 ```
 
 MSRV: Rust 1.85 (2024 edition).
@@ -201,6 +212,42 @@ assert!(lm.try_acquire(reader, row, LockMode::Shared).is_err());
 
 ---
 
+## Deadlock detection
+
+[`try_acquire`](#lockmanagertry_acquire) never blocks and never tracks anything:
+on conflict the caller is free to retry, but the manager has no idea who is
+waiting for whom, so it cannot tell a transient conflict from a genuine
+deadlock. [`request`](#lockmanagerrequest) is the deadlock-aware path. On
+conflict it records, in a **wait-for graph**, that the requesting transaction is
+waiting for the current holders, then checks whether that closed a cycle.
+
+- No cycle → [`Acquisition::Waiting`]. The caller suspends the transaction (with
+  its own scheduler) and calls `request` again later to retry.
+- Cycle → [`Acquisition::Deadlock`] carrying a [`Deadlock`](#victimpolicy-and-deadlock)
+  with the cycle and a chosen `victim`. The caller aborts the victim with
+  [`release_all`](#lockmanagerrelease_all), which frees its locks and clears its
+  wait, breaking the cycle.
+
+lock-db does not park threads; the transaction layer owns suspension and retry.
+Detection is **exact**: the graph is rebuilt from the current lock table on every
+check, so a wait left over from a since-released lock contributes no edge, and a
+transaction is never reported as deadlocked unless it genuinely is.
+
+Two detection modes share this machinery: [`request`](#lockmanagerrequest)
+detects at the moment a wait is added (responsive), and
+[`find_deadlock`](#lockmanagerfind_deadlock) scans the whole wait set on demand
+(for a periodic background detector). The wait-for graph itself is exposed as
+[`WaitForGraph`](#waitforgraph) for direct use and testing.
+
+> Only transactions that wait through `request` appear in the graph. A
+> transaction that spins on `try_acquire` is invisible to detection, and range
+> locks are not tracked in it.
+
+---
+
+[`Acquisition::Waiting`]: #acquisition
+[`Acquisition::Deadlock`]: #acquisition
+
 ## Public API
 
 ### `LockManager`
@@ -223,9 +270,13 @@ use lock_db::LockManager;
 | [`release_all`](#lockmanagerrelease_all) | Drop every lock (point and range) a transaction holds. |
 | [`try_acquire_range`](#lockmanagertry_acquire_range) | Take a range lock, or fail without blocking. |
 | [`release_range`](#lockmanagerrelease_range) | Drop one range lock. |
+| [`request`](#lockmanagerrequest) | Deadlock-aware acquire: grant, register a wait, or report a deadlock. |
+| [`cancel_wait`](#lockmanagercancel_wait) | Remove a transaction's pending wait. |
+| [`find_deadlock`](#lockmanagerfind_deadlock) | Scan the wait set for a deadlock (periodic detection). |
 | [`holder_count`](#lockmanagerholder_count) | How many transactions hold a resource. |
 | [`mode_held`](#lockmanagermode_held) | The mode a transaction holds, if any. |
 | [`range_count`](#lockmanagerrange_count) | How many range locks are live in a space. |
+| [`waiting_count`](#lockmanagerwaiting_count) | How many transactions are registered as waiting. |
 | [`shards`](#lockmanagershards) | The shard count. |
 
 `LockManager` also implements [`Default`](https://doc.rust-lang.org/std/default/trait.Default.html)
@@ -499,6 +550,139 @@ assert_eq!(lm.release_range(t, index, r), Err(LockError::NotHeld));
 
 ---
 
+#### `LockManager::request`
+
+```rust
+pub fn request(&self, txn: TxnId, res: ResourceId, mode: LockMode) -> Acquisition
+```
+
+The deadlock-aware counterpart to [`try_acquire`](#lockmanagertry_acquire).
+Returns an [`Acquisition`](#acquisition):
+
+- `Granted` — the lock was granted; proceed.
+- `Waiting` — the lock is held incompatibly and `txn` is now recorded in the
+  wait-for graph. Suspend the transaction and call `request` again later. No
+  deadlock was found.
+- `Deadlock(d)` — granting the wait would close a cycle. Abort `d.victim` with
+  [`release_all`](#lockmanagerrelease_all). The victim may be `txn` or another
+  transaction in the cycle.
+
+The victim is chosen by the [`VictimPolicy::Youngest`](#victimpolicy-and-deadlock)
+policy; for a different policy, apply
+[`WaitForGraph::pick_victim`](#waitforgraph) to `d.cycle`. Only point locks taken
+through `request` participate in detection (see [Deadlock detection](#deadlock-detection)).
+
+> **Performance.** `request` serializes on a single wait-registry mutex, unlike
+> the sharded `try_acquire`. Use `try_acquire` when you do not need deadlock
+> detection, and `request` when you do.
+
+**Examples**
+
+```rust
+use lock_db::{Acquisition, LockManager, LockMode, ResourceId, TxnId};
+
+let lm = LockManager::new();
+let (a, b) = (ResourceId::new(1), ResourceId::new(2));
+let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+
+assert_eq!(lm.request(t1, a, LockMode::Exclusive), Acquisition::Granted);
+assert_eq!(lm.request(t2, b, LockMode::Exclusive), Acquisition::Granted);
+assert_eq!(lm.request(t1, b, LockMode::Exclusive), Acquisition::Waiting);
+
+match lm.request(t2, a, LockMode::Exclusive) {
+    Acquisition::Deadlock(d) => {
+        assert_eq!(d.victim, TxnId::new(2)); // youngest in the cycle
+        lm.release_all(d.victim);            // break the deadlock
+    }
+    other => panic!("expected a deadlock, got {other:?}"),
+}
+```
+
+A simple retry-on-wait loop a caller might build (a real one would suspend the
+transaction and be woken on release rather than spin):
+
+```rust
+use lock_db::{Acquisition, LockManager, LockMode, ResourceId, TxnId};
+
+fn acquire_or_abort(lm: &LockManager, txn: TxnId, res: ResourceId, mode: LockMode) -> bool {
+    loop {
+        match lm.request(txn, res, mode) {
+            Acquisition::Granted => return true,
+            Acquisition::Waiting => std::hint::spin_loop(),
+            Acquisition::Deadlock(d) => {
+                lm.release_all(d.victim);
+                if d.victim == txn {
+                    return false; // we were chosen to abort
+                }
+            }
+        }
+    }
+}
+
+let lm = LockManager::new();
+assert!(acquire_or_abort(&lm, TxnId::new(1), ResourceId::new(1), LockMode::Exclusive));
+```
+
+---
+
+#### `LockManager::cancel_wait`
+
+```rust
+pub fn cancel_wait(&self, txn: TxnId)
+```
+
+Removes any pending wait for `txn` from the wait-for graph. Call this when a
+transaction that previously got [`Acquisition::Waiting`](#acquisition) stops
+waiting without acquiring the lock (for example a timeout).
+[`release_all`](#lockmanagerrelease_all) already clears the wait, so this is only
+needed when the transaction is releasing nothing.
+
+**Example**
+
+```rust
+use lock_db::{Acquisition, LockManager, LockMode, ResourceId, TxnId};
+
+let lm = LockManager::new();
+let res = ResourceId::new(1);
+lm.request(TxnId::new(1), res, LockMode::Exclusive);
+assert_eq!(lm.request(TxnId::new(2), res, LockMode::Exclusive), Acquisition::Waiting);
+lm.cancel_wait(TxnId::new(2));
+assert_eq!(lm.waiting_count(), 0);
+```
+
+---
+
+#### `LockManager::find_deadlock`
+
+```rust
+pub fn find_deadlock(&self) -> Option<Deadlock>
+```
+
+Scans the current wait set for a deadlock, returning one if found. This is the
+periodic-detection counterpart to the at-wait detection in
+[`request`](#lockmanagerrequest): a background task can call it on an interval
+instead of (or as well as) acting on `request`'s result. Like `request`, it
+rebuilds the graph from the current lock table, so it reports only genuine
+deadlocks.
+
+**Example**
+
+```rust
+use lock_db::{LockManager, LockMode, ResourceId, TxnId};
+
+let lm = LockManager::new();
+let (a, b) = (ResourceId::new(1), ResourceId::new(2));
+lm.request(TxnId::new(1), a, LockMode::Exclusive);
+lm.request(TxnId::new(2), b, LockMode::Exclusive);
+lm.request(TxnId::new(1), b, LockMode::Exclusive); // T1 waits for T2
+assert!(lm.find_deadlock().is_none());
+lm.request(TxnId::new(2), a, LockMode::Exclusive); // T2 waits for T1: cycle
+let d = lm.find_deadlock().expect("a deadlock");
+assert_eq!(d.cycle.len(), 2);
+```
+
+---
+
 #### `LockManager::holder_count`
 
 ```rust
@@ -571,6 +755,27 @@ assert_eq!(lm.range_count(index), 1);
 
 ---
 
+#### `LockManager::waiting_count`
+
+```rust
+pub fn waiting_count(&self) -> usize
+```
+
+Returns the number of transactions currently registered as waiting (via
+[`request`](#lockmanagerrequest)). Mostly useful for diagnostics and tests.
+
+```rust
+use lock_db::{LockManager, LockMode, ResourceId, TxnId};
+
+let lm = LockManager::new();
+let r = ResourceId::new(1);
+lm.request(TxnId::new(1), r, LockMode::Exclusive);
+lm.request(TxnId::new(2), r, LockMode::Exclusive); // waits
+assert_eq!(lm.waiting_count(), 1);
+```
+
+---
+
 #### `LockManager::shards`
 
 ```rust
@@ -583,6 +788,122 @@ Returns the number of shards in the table — always a power of two.
 use lock_db::LockManager;
 
 assert_eq!(LockManager::with_shards(10).shards(), 16);
+```
+
+---
+
+### `Acquisition`
+
+The outcome of a deadlock-aware [`request`](#lockmanagerrequest). `std`.
+
+```rust
+pub enum Acquisition {
+    Granted,
+    Waiting,
+    Deadlock(Deadlock),
+}
+```
+
+| Variant | Meaning | Caller should |
+|---------|---------|---------------|
+| `Granted` | The lock is held. | Proceed. |
+| `Waiting` | Recorded as waiting; no cycle. | Suspend and retry `request` later. |
+| `Deadlock(Deadlock)` | The wait closes a cycle. | Abort [`Deadlock::victim`](#victimpolicy-and-deadlock). |
+
+`Acquisition` is `#[must_use]`: the whole point of the call is to act on which
+variant comes back.
+
+---
+
+### `WaitForGraph`
+
+A directed graph of which transactions are waiting for which, with cycle
+detection. [`LockManager`](#lockmanager) builds one internally to detect
+deadlocks; it is also public so callers can run their own detection (for example
+over wait information they track elsewhere) and so the algorithm is testable in
+isolation. `std`.
+
+An edge `a -> b` means transaction `a` is blocked waiting for a lock held by
+transaction `b`.
+
+```rust
+use lock_db::WaitForGraph;
+```
+
+| Method | Signature | Summary |
+|--------|-----------|---------|
+| `new` | `fn new() -> WaitForGraph` | An empty graph. |
+| `add_wait` | `fn add_wait(&mut self, waiter: TxnId, holder: TxnId)` | Record `waiter` waits for `holder` (self-edges ignored). |
+| `add_waits` | `fn add_waits(&mut self, waiter: TxnId, holders: &[TxnId])` | Record `waiter` waits for many holders. |
+| `clear_waiter` | `fn clear_waiter(&mut self, waiter: TxnId)` | Remove every edge from `waiter`. |
+| `remove_txn` | `fn remove_txn(&mut self, txn: TxnId)` | Remove `txn` as waiter and as holder. |
+| `detect_cycle` | `fn detect_cycle(&self) -> Option<Vec<TxnId>>` | Any cycle in the graph. |
+| `cycle_from` | `fn cycle_from(&self, start: TxnId) -> Option<Vec<TxnId>>` | A cycle reachable from `start`. |
+| `pick_victim` | `fn pick_victim(cycle: &[TxnId], policy: VictimPolicy) -> Option<TxnId>` | Choose a victim from a cycle. |
+| `is_empty` / `waiter_count` | — | Whether / how many transactions are waiting. |
+
+Detection uses an iterative depth-first search (no recursion, so a long wait
+chain cannot overflow the stack).
+
+**Examples**
+
+```rust
+use lock_db::{TxnId, VictimPolicy, WaitForGraph};
+
+let mut g = WaitForGraph::new();
+// T1 -> T2 -> T3 -> T1 is a deadlock.
+g.add_wait(TxnId::new(1), TxnId::new(2));
+g.add_wait(TxnId::new(2), TxnId::new(3));
+g.add_wait(TxnId::new(3), TxnId::new(1));
+
+let cycle = g.detect_cycle().expect("a cycle");
+assert_eq!(cycle.len(), 3);
+assert_eq!(WaitForGraph::pick_victim(&cycle, VictimPolicy::Youngest), Some(TxnId::new(3)));
+```
+
+A chain with no back edge has no cycle:
+
+```rust
+use lock_db::{TxnId, WaitForGraph};
+
+let mut g = WaitForGraph::new();
+g.add_wait(TxnId::new(1), TxnId::new(2));
+g.add_wait(TxnId::new(2), TxnId::new(3));
+assert!(g.detect_cycle().is_none());
+```
+
+---
+
+### `VictimPolicy` and `Deadlock`
+
+`VictimPolicy` chooses which member of a cycle to abort; `Deadlock` is the
+detected cycle plus the chosen victim. Both `std`; `VictimPolicy` derives `serde`
+under the `serde` feature.
+
+```rust
+pub enum VictimPolicy {
+    Youngest, // abort the largest TxnId (default)
+    Oldest,   // abort the smallest TxnId
+}
+
+pub struct Deadlock {
+    pub victim: TxnId,
+    pub cycle: Vec<TxnId>,
+}
+```
+
+Transaction ids are taken as a proxy for age — a larger id started later. Both
+policies break the cycle correctly; they differ only in which transaction pays.
+[`request`](#lockmanagerrequest) and [`find_deadlock`](#lockmanagerfind_deadlock)
+use `Youngest`; apply [`WaitForGraph::pick_victim`](#waitforgraph) to
+`Deadlock::cycle` for a different choice.
+
+```rust
+use lock_db::{TxnId, VictimPolicy, WaitForGraph};
+
+let cycle = [TxnId::new(3), TxnId::new(7), TxnId::new(5)];
+assert_eq!(WaitForGraph::pick_victim(&cycle, VictimPolicy::Youngest), Some(TxnId::new(7)));
+assert_eq!(WaitForGraph::pick_victim(&cycle, VictimPolicy::Oldest), Some(TxnId::new(3)));
 ```
 
 ---
@@ -792,7 +1113,8 @@ lm.try_acquire_range(TxnId::new(1), ResourceId::new(2), KeyRange::point(5), Lock
 ```
 
 The prelude contains `LockMode`, `KeyRange`, `TxnId`, `ResourceId`, `LockError`,
-and (under the `std` feature) `LockManager`.
+and (under the `std` feature) `LockManager`, `Acquisition`, `WaitForGraph`,
+`VictimPolicy`, and `Deadlock`.
 
 ---
 
@@ -800,8 +1122,8 @@ and (under the `std` feature) `LockManager`.
 
 | Feature | Default | Description |
 |---------|---------|-------------|
-| `std` | yes | Enables `LockManager` and the `std::error::Error` impl. With `std` off, the crate is `no_std` and exposes only `LockMode`, `KeyRange`, `TxnId`, `ResourceId`, and `LockError`. |
-| `serde` | no | Derives `serde::Serialize` / `Deserialize` on `LockMode`, `KeyRange`, `TxnId`, `ResourceId`, and `LockError`. |
+| `std` | yes | Enables `LockManager`, `Acquisition`, `WaitForGraph`, `VictimPolicy`, `Deadlock`, and the `std::error::Error` impl. With `std` off, the crate is `no_std` and exposes only `LockMode`, `KeyRange`, `TxnId`, `ResourceId`, and `LockError`. |
+| `serde` | no | Derives `serde::Serialize` / `Deserialize` on `LockMode`, `KeyRange`, `TxnId`, `ResourceId`, `LockError`, and `VictimPolicy`. |
 
 ---
 
@@ -842,6 +1164,37 @@ lm.try_acquire_range(reader, index, KeyRange::new(100, 200).unwrap(), LockMode::
 
 // An insert of id 150 by another transaction is now blocked.
 assert!(lm.try_acquire_range(TxnId::new(2), index, KeyRange::point(150), LockMode::Exclusive).is_err());
+```
+
+**Deadlock handling.** Use [`request`](#lockmanagerrequest) instead of
+`try_acquire` when a transaction is willing to wait; on
+[`Acquisition::Deadlock`](#acquisition) abort the named victim. The victim's own
+worker, on its next `request`, will get a clean grant or waiting result once the
+cycle is gone:
+
+```rust
+use lock_db::prelude::*;
+
+fn acquire_or_abort(lm: &LockManager, txn: TxnId, res: ResourceId, mode: LockMode) -> bool {
+    loop {
+        match lm.request(txn, res, mode) {
+            Acquisition::Granted => return true,
+            Acquisition::Waiting => {
+                // A real caller suspends the transaction and is woken on a
+                // release; this loop stands in for that.
+                std::hint::spin_loop();
+            }
+            Acquisition::Deadlock(d) => {
+                lm.release_all(d.victim);
+                if d.victim == txn {
+                    return false; // we were the victim
+                }
+            }
+        }
+    }
+}
+# let lm = LockManager::new();
+# assert!(acquire_or_abort(&lm, TxnId::new(1), ResourceId::new(1), LockMode::Exclusive));
 ```
 
 ---

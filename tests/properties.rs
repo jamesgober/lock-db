@@ -14,9 +14,9 @@
 #![cfg(feature = "std")]
 #![allow(clippy::unwrap_used)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
-use lock_db::{KeyRange, LockError, LockManager, LockMode, ResourceId, TxnId};
+use lock_db::{KeyRange, LockError, LockManager, LockMode, ResourceId, TxnId, WaitForGraph};
 use proptest::prelude::*;
 
 /// Small fixed universe keeps contention high and the shrunk cases readable.
@@ -353,6 +353,77 @@ proptest! {
             for s in 0..SPACES {
                 let expected = model.spaces.get(&s).map_or(0, Vec::len);
                 prop_assert_eq!(lm.range_count(ResourceId::new(s)), expected);
+            }
+        }
+    }
+}
+
+// ---- wait-for graph / deadlock detection ----
+
+/// Independent reference for acyclicity: Kahn's algorithm. Repeatedly strip
+/// nodes with no outstanding "waits-for" edge; if any remain, there is a cycle.
+fn has_cycle(edges: &[(u64, u64)]) -> bool {
+    let mut adj: HashMap<u64, Vec<u64>> = HashMap::new();
+    let mut indeg: HashMap<u64, usize> = HashMap::new();
+    let mut nodes: HashSet<u64> = HashSet::new();
+    for &(a, b) in edges {
+        if a == b {
+            continue; // self-edges are ignored by the graph too
+        }
+        adj.entry(a).or_default().push(b);
+        *indeg.entry(b).or_default() += 1;
+        let _ = indeg.entry(a).or_default();
+        let _ = nodes.insert(a);
+        let _ = nodes.insert(b);
+    }
+    let mut queue: VecDeque<u64> = nodes
+        .iter()
+        .filter(|n| indeg.get(n).copied().unwrap_or(0) == 0)
+        .copied()
+        .collect();
+    let mut removed = 0usize;
+    while let Some(n) = queue.pop_front() {
+        removed += 1;
+        if let Some(succ) = adj.get(&n) {
+            for &m in succ {
+                let d = indeg.entry(m).or_default();
+                *d = d.saturating_sub(1);
+                if *d == 0 {
+                    queue.push_back(m);
+                }
+            }
+        }
+    }
+    removed != nodes.len()
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(500))]
+
+    /// `WaitForGraph::detect_cycle` reports a cycle if and only if the graph
+    /// actually has one, cross-checked against Kahn's topological sort. And when
+    /// it reports one, the returned vertices form a genuine directed cycle.
+    #[test]
+    fn wait_for_graph_detects_cycles_exactly(
+        edges in proptest::collection::vec((0..6u64, 0..6u64), 0..40),
+    ) {
+        let mut graph = WaitForGraph::new();
+        for &(a, b) in &edges {
+            graph.add_wait(TxnId::new(a), TxnId::new(b));
+        }
+
+        let detected = graph.detect_cycle();
+        prop_assert_eq!(detected.is_some(), has_cycle(&edges));
+
+        if let Some(cycle) = detected {
+            // Every consecutive pair (and the wrap-around) must be a real edge.
+            let edge_set: HashSet<(u64, u64)> =
+                edges.iter().copied().filter(|(a, b)| a != b).collect();
+            prop_assert!(!cycle.is_empty());
+            for i in 0..cycle.len() {
+                let from = cycle[i].get();
+                let to = cycle[(i + 1) % cycle.len()].get();
+                prop_assert!(edge_set.contains(&(from, to)), "fake edge {} -> {}", from, to);
             }
         }
     }

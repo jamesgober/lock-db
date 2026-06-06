@@ -9,6 +9,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-05
+
+Wait-for deadlock detection, and the feature freeze. This release completes the
+1.0 feature set: a wait-for graph with cycle detection and victim selection, and
+a deadlock-aware acquisition path on the lock manager. The public API is frozen
+as of this release; remaining 0.x work is hardening only.
+
+### Added
+
+- `WaitForGraph` — a wait-for graph with iterative-DFS cycle detection
+  (`detect_cycle`, `cycle_from`), edge maintenance (`add_wait`, `add_waits`,
+  `clear_waiter`, `remove_txn`), and `pick_victim`.
+- `VictimPolicy` (`Youngest` default, `Oldest`) and `Deadlock` (`victim` +
+  `cycle`).
+- `Acquisition` — the outcome of the new deadlock-aware acquisition
+  (`Granted` / `Waiting` / `Deadlock`).
+- `LockManager::request` — deadlock-aware acquire: grants, or registers a wait
+  and reports `Waiting`, or reports `Deadlock` with a victim when the wait closes
+  a cycle. Detection rebuilds the graph from the current lock table, so it never
+  aborts a transaction that is not genuinely deadlocked.
+- `LockManager::cancel_wait`, `find_deadlock` (on-demand/periodic detection), and
+  `waiting_count`.
+- Example `deadlock`; a `WaitForGraph` property test against Kahn's algorithm; a
+  `loom` model check for the classic two-transaction deadlock; a `request`
+  benchmark.
+
+### Changed
+
+- `LockManager::release_all` now also clears a transaction's pending wait.
+- **API frozen.** As of v0.4.0 the public API is stable; no further additions are
+  planned before 1.0.
+
 ## [0.3.0] - 2026-06-05
 
 Multi-granularity and range locking. This release extends the lock-table core
@@ -80,7 +112,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` (Node 24 actions; fmt, clippy, test, doc, audit, deny) and `.github/FUNDING.yml`.
 
 <!-- LINKS -->
-[Unreleased]: https://github.com/jamesgober/lock-db/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lock-db/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/jamesgober/lock-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/lock-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/lock-db/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/lock-db/releases/tag/v0.1.0

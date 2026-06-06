@@ -15,7 +15,7 @@
 #![cfg(loom)]
 #![allow(clippy::unwrap_used)]
 
-use lock_db::{KeyRange, LockManager, LockMode, ResourceId, TxnId};
+use lock_db::{Acquisition, KeyRange, LockManager, LockMode, ResourceId, TxnId};
 use loom::sync::Arc;
 
 /// Two transactions race to take the same resource exclusively. Whoever wins,
@@ -114,5 +114,40 @@ fn loom_overlapping_ranges_are_mutually_exclusive() {
 
         other.join().unwrap();
         assert_eq!(lm.range_count(space), 0);
+    });
+}
+
+/// The classic two-transaction deadlock under every interleaving: T1 holds A and
+/// wants B, T2 holds B and wants A. Whatever the schedule, the deadlock-aware
+/// `request` path must never leave a cycle undetected — after each thread acts
+/// (aborting its victim on detection), no deadlock may remain. This also
+/// exercises the `waits` / shard lock ordering: loom would flag a mutex-ordering
+/// deadlock in the manager itself if one existed.
+#[test]
+fn loom_two_transaction_deadlock_is_always_resolved() {
+    loom::model(|| {
+        let lm = Arc::new(LockManager::with_shards(1));
+        let (a, b) = (ResourceId::new(1), ResourceId::new(2));
+        let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+
+        let lm2 = Arc::clone(&lm);
+        let other = loom::thread::spawn(move || {
+            if lm2.request(t2, b, LockMode::Exclusive) == Acquisition::Granted {
+                if let Acquisition::Deadlock(d) = lm2.request(t2, a, LockMode::Exclusive) {
+                    lm2.release_all(d.victim);
+                }
+            }
+        });
+
+        if lm.request(t1, a, LockMode::Exclusive) == Acquisition::Granted {
+            if let Acquisition::Deadlock(d) = lm.request(t1, b, LockMode::Exclusive) {
+                lm.release_all(d.victim);
+            }
+        }
+
+        other.join().unwrap();
+
+        // No cycle may survive: a missed detection would leave one here.
+        assert!(lm.find_deadlock().is_none());
     });
 }

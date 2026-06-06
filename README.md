@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Row/range locks. Hierarchical granularity. Wait-for deadlock detection.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> <code>v0.3.0</code> adds multi-granularity and range locking &mdash; the five MGL modes (IS, IX, S, SIX, X), lattice upgrades, and key-range locks for phantom protection &mdash; on top of the sharded lock-table core. Wait queues and wait-for deadlock detection land across the rest of the 0.x series per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. The public API is frozen at <code>1.0.0</code>.
+        <strong>Status: feature-complete, API frozen.</strong> As of <code>v0.4.0</code> the feature set is complete and the public API is frozen ahead of <code>1.0.0</code>: the five MGL modes, hierarchical and range locks, and wait-for deadlock detection are all in place. The remaining 0.x work is hardening and soak testing per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -38,18 +38,12 @@
 
 <h2>What it does</h2>
 
-In this release (`v0.3.0`):
-
 - **Lock modes** &mdash; the five standard multi-granularity modes &mdash; intention-shared (IS), intention-exclusive (IX), shared (S), shared-intention-exclusive (SIX), and exclusive (X) &mdash; with a `const` compatibility matrix at the core of every grant decision
 - **Hierarchical granularities** &mdash; lock a database / table / page / row hierarchy correctly with intention locks; the manager enforces the matrix at every level
 - **Range locks** &mdash; lock a contiguous span of keys (`KeyRange`) for predicate / phantom protection, with overlap-based conflict detection
+- **Deadlock detection** &mdash; a wait-for graph with cycle detection and victim selection; the deadlock-aware `request` records waits and reports cycles, and `WaitForGraph` is reusable on its own
 - **Sharded lock table** &mdash; the resource space is partitioned across independent shards so acquisitions on unrelated resources never contend on the same mutex
 - **Acquire / release** &mdash; non-blocking `try_acquire`, single and bulk release, re-entrant acquisition, and lattice upgrades (e.g. S + IX &rarr; SIX)
-
-Planned across the rest of the 0.x series (see [`dev/ROADMAP.md`](./dev/ROADMAP.md)):
-
-- **Wait / grant queues** &mdash; fair, blocking acquisition with upgrade handling
-- **Deadlock detection** &mdash; a wait-for graph with cycle detection and configurable victim selection
 
 <br>
 <hr>
@@ -59,7 +53,7 @@ Planned across the rest of the 0.x series (see [`dev/ROADMAP.md`](./dev/ROADMAP.
 
 ```toml
 [dependencies]
-lock-db = "0.3"
+lock-db = "0.4"
 ```
 
 <br>
@@ -116,6 +110,26 @@ for id in 0..3 {
 assert_eq!(lm.release_all(txn), 3);
 ```
 
+The deadlock-aware `request` records waits and reports cycles, naming a victim to
+abort:
+
+```rust
+use lock_db::prelude::*;
+
+let lm = LockManager::new();
+let (a, b) = (ResourceId::new(1), ResourceId::new(2));
+let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+
+lm.request(t1, a, LockMode::Exclusive); // T1 holds A
+lm.request(t2, b, LockMode::Exclusive); // T2 holds B
+lm.request(t1, b, LockMode::Exclusive); // T1 waits for T2
+
+// T2 waiting for A closes the cycle; abort the victim to break it.
+if let Acquisition::Deadlock(d) = lm.request(t2, a, LockMode::Exclusive) {
+    lm.release_all(d.victim);
+}
+```
+
 <br>
 
 ## API Overview
@@ -123,7 +137,8 @@ assert_eq!(lm.release_all(txn), 3);
 For the complete reference with method tables and examples, see [`docs/API.md`](./docs/API.md).
 
 - [`LockMode`](./docs/API.md#lockmode) &mdash; the five MGL modes and the compatibility matrix
-- [`LockManager`](./docs/API.md#lockmanager) &mdash; the sharded lock table (point and range locks)
+- [`LockManager`](./docs/API.md#lockmanager) &mdash; the sharded lock table (point locks, range locks, deadlock-aware `request`)
+- [`WaitForGraph`](./docs/API.md#waitforgraph) &mdash; wait-for graph, cycle detection, and victim selection
 - [`KeyRange`](./docs/API.md#keyrange) &mdash; an inclusive key interval for range locks
 - [`TxnId` and `ResourceId`](./docs/API.md#identifiers) &mdash; opaque identifiers
 - [`LockError`](./docs/API.md#lockerror) &mdash; failure modes
@@ -142,6 +157,7 @@ Runnable examples live in [`examples/`](./examples). Run any of them with
 | [`shared_upgrade`](./examples/shared_upgrade.rs) | Read under a shared lock, then upgrade to exclusive. |
 | [`hierarchy`](./examples/hierarchy.rs) | Intention locks over a database/table/page/row hierarchy. |
 | [`range_locks`](./examples/range_locks.rs) | Range locking for phantom protection. |
+| [`deadlock`](./examples/deadlock.rs) | Wait-for deadlock detection and victim abort. |
 | [`concurrent`](./examples/concurrent.rs) | Many threads contending on one row, with a mutual-exclusion check. |
 
 <br>

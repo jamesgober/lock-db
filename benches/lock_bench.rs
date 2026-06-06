@@ -172,6 +172,41 @@ fn bench_range_acquire_release(c: &mut Criterion) {
     group.finish();
 }
 
+/// The deadlock-aware `request` granted path, against a wait set of a given
+/// size (the cost of taking the global wait lock plus, on the granted path, no
+/// graph build). Compare with `acquire_release/exclusive` to see the overhead of
+/// deadlock tracking versus the sharded fast path.
+#[cfg(feature = "std")]
+fn bench_request_granted(c: &mut Criterion) {
+    use lock_db::Acquisition;
+
+    let mut group = c.benchmark_group("request/granted_vs_waiters");
+    for &waiters in &[0u64, 64] {
+        let lm = LockManager::new();
+        // Park `waiters` transactions on a single contended resource so the wait
+        // set is non-empty (the granted path still does not build the graph).
+        let parked = ResourceId::new(u64::MAX);
+        let _ = lm.request(TxnId::new(1), parked, LockMode::Exclusive);
+        for w in 0..waiters {
+            let _ = lm.request(TxnId::new(1000 + w), parked, LockMode::Exclusive);
+        }
+        let txn = TxnId::new(2);
+        let mut next = 0u64;
+        group.bench_with_input(BenchmarkId::from_parameter(waiters), &waiters, |b, _| {
+            b.iter(|| {
+                let res = ResourceId::new(next);
+                next = next.wrapping_add(1);
+                assert!(matches!(
+                    lm.request(txn, res, LockMode::Exclusive),
+                    Acquisition::Granted
+                ));
+                lm.release(txn, res).unwrap();
+            });
+        });
+    }
+    group.finish();
+}
+
 #[cfg(feature = "std")]
 criterion_group!(
     benches,
@@ -181,6 +216,7 @@ criterion_group!(
     bench_release_all,
     bench_contended,
     bench_range_acquire_release,
+    bench_request_granted,
 );
 #[cfg(feature = "std")]
 criterion_main!(benches);

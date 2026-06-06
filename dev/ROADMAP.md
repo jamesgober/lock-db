@@ -30,10 +30,16 @@ Exit criteria:
 
 ---
 
-## v0.4.0 -- wait-for graph + deadlock detection + victim selection + feature freeze
+## v0.4.0 -- wait-for graph + deadlock detection + victim selection + feature freeze (DONE)
 
 Exit criteria:
-- [ ] No `todo!`/`unimplemented!`. Feature freeze declared.
+- [x] No `todo!`/`unimplemented!`. Feature freeze declared.
+
+**Feature freeze declared as of v0.4.0.** The public surface (`LockManager`,
+`LockMode`, `KeyRange`, `TxnId`, `ResourceId`, `LockError`, `Acquisition`,
+`WaitForGraph`, `VictimPolicy`, `Deadlock`, `prelude`) is complete. No further
+features before 1.0 — remaining work is hardening, adversarial testing, and the
+formal API freeze.
 
 ---
 
