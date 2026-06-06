@@ -136,6 +136,42 @@ fn bench_contended(c: &mut Criterion) {
     group.finish();
 }
 
+/// Range acquire+release against a space already holding a number of
+/// non-overlapping ranges, to show how the linear overlap scan scales with the
+/// number of live ranges in a space.
+#[cfg(feature = "std")]
+fn bench_range_acquire_release(c: &mut Criterion) {
+    use lock_db::KeyRange;
+
+    let mut group = c.benchmark_group("range/acquire_release_vs_live");
+    for &live in &[0u64, 64, 1024] {
+        let lm = LockManager::new();
+        let space = ResourceId::new(1);
+        // Pre-populate `live` disjoint shared ranges held by a background txn.
+        let bg = TxnId::new(999);
+        for i in 0..live {
+            let lo = i * 10;
+            let range = KeyRange::new(lo, lo + 5).unwrap();
+            lm.try_acquire_range(bg, space, range, LockMode::Shared)
+                .unwrap();
+        }
+        let txn = TxnId::new(1);
+        let mut next = live * 10;
+        group.bench_with_input(BenchmarkId::from_parameter(live), &live, |b, _| {
+            b.iter(|| {
+                // A fresh disjoint range each time: no conflict, full scan.
+                let lo = next;
+                next += 10;
+                let range = KeyRange::new(lo, lo + 5).unwrap();
+                lm.try_acquire_range(txn, space, range, LockMode::Shared)
+                    .unwrap();
+                lm.release_range(txn, space, range).unwrap();
+            });
+        });
+    }
+    group.finish();
+}
+
 #[cfg(feature = "std")]
 criterion_group!(
     benches,
@@ -144,6 +180,7 @@ criterion_group!(
     bench_upgrade,
     bench_release_all,
     bench_contended,
+    bench_range_acquire_release,
 );
 #[cfg(feature = "std")]
 criterion_main!(benches);

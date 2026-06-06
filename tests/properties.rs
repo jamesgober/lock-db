@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use lock_db::{LockError, LockManager, LockMode, ResourceId, TxnId};
+use lock_db::{KeyRange, LockError, LockManager, LockMode, ResourceId, TxnId};
 use proptest::prelude::*;
 
 /// Small fixed universe keeps contention high and the shrunk cases readable.
@@ -29,18 +29,22 @@ enum Op {
     Release { txn: u64, res: u64 },
 }
 
+const MODES: [LockMode; 5] = [
+    LockMode::IntentionShared,
+    LockMode::IntentionExclusive,
+    LockMode::Shared,
+    LockMode::SharedIntentionExclusive,
+    LockMode::Exclusive,
+];
+
 fn op_strategy() -> impl Strategy<Value = Op> {
     let txn = 0..TXNS;
     let res = 0..RESOURCES;
     prop_oneof![
-        (txn.clone(), res.clone(), any::<bool>()).prop_map(|(txn, res, exclusive)| Op::Acquire {
+        (txn.clone(), res.clone(), 0..MODES.len()).prop_map(|(txn, res, m)| Op::Acquire {
             txn,
             res,
-            mode: if exclusive {
-                LockMode::Exclusive
-            } else {
-                LockMode::Shared
-            },
+            mode: MODES[m],
         }),
         (txn, res).prop_map(|(txn, res)| Op::Release { txn, res }),
     ]
@@ -68,17 +72,17 @@ impl Model {
             if current.covers(mode) {
                 return Ok(());
             }
-            // shared -> exclusive upgrade: only legal as the sole holder.
-            let others = self
+            // Upgrade to the join, allowed only if compatible with other holders.
+            let target = current.join(mode);
+            let blocked = self
                 .holders_of(res)
                 .into_iter()
-                .filter(|(t, _)| *t != txn)
-                .count();
-            if others == 0 {
-                let _ = self.held.insert((txn, res), mode);
-                return Ok(());
+                .any(|(t, held)| t != txn && !held.compatible_with(target));
+            if blocked {
+                return Err(LockError::Conflict);
             }
-            return Err(LockError::Conflict);
+            let _ = self.held.insert((txn, res), target);
+            return Ok(());
         }
 
         let compatible = self
@@ -101,23 +105,23 @@ impl Model {
         }
     }
 
-    /// The compatibility invariant the manager must always satisfy: every
-    /// resource is held either by any number of shared locks or by exactly one
-    /// exclusive lock.
+    /// The compatibility invariant the manager must always satisfy: every pair
+    /// of distinct holders of the same resource holds compatible modes.
     fn assert_internally_consistent(&self) {
         let mut by_res: HashMap<u64, Vec<LockMode>> = HashMap::new();
         for ((_, res), mode) in &self.held {
             by_res.entry(*res).or_default().push(*mode);
         }
         for modes in by_res.values() {
-            let exclusives = modes.iter().filter(|m| m.is_exclusive()).count();
-            if exclusives > 0 {
-                assert_eq!(exclusives, 1, "more than one exclusive holder");
-                assert_eq!(
-                    modes.len(),
-                    1,
-                    "exclusive lock coexists with another holder"
-                );
+            for i in 0..modes.len() {
+                for j in (i + 1)..modes.len() {
+                    assert!(
+                        modes[i].compatible_with(modes[j]),
+                        "incompatible holders coexist: {:?} and {:?}",
+                        modes[i],
+                        modes[j],
+                    );
+                }
             }
         }
     }
@@ -206,6 +210,149 @@ proptest! {
             for r in 0..RESOURCES {
                 let expected = model.held.get(&(t, r)).copied();
                 prop_assert_eq!(lm.mode_held(TxnId::new(t), ResourceId::new(r)), expected);
+            }
+        }
+    }
+}
+
+// ---- range locks ----
+
+const SPACES: u64 = 2;
+const KEY_MAX: u64 = 7;
+
+#[derive(Clone, Copy, Debug)]
+enum RangeOp {
+    Acquire {
+        txn: u64,
+        space: u64,
+        range: KeyRange,
+        mode: LockMode,
+    },
+    Release {
+        txn: u64,
+        space: u64,
+        range: KeyRange,
+    },
+}
+
+fn range_strategy() -> impl Strategy<Value = KeyRange> {
+    (0..=KEY_MAX, 0..=KEY_MAX).prop_map(|(a, b)| {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        KeyRange::new(lo, hi).unwrap()
+    })
+}
+
+fn range_op_strategy() -> impl Strategy<Value = RangeOp> {
+    let txn = 0..TXNS;
+    let space = 0..SPACES;
+    prop_oneof![
+        (txn.clone(), space.clone(), range_strategy(), 0..MODES.len()).prop_map(
+            |(txn, space, range, m)| RangeOp::Acquire {
+                txn,
+                space,
+                range,
+                mode: MODES[m],
+            }
+        ),
+        (txn, space, range_strategy()).prop_map(|(txn, space, range)| RangeOp::Release {
+            txn,
+            space,
+            range
+        }),
+    ]
+}
+
+/// Reference model for range locks, mirroring the manager's storage exactly: a
+/// per-space `Vec` of holders, pushed on acquire and `swap_remove`d on release,
+/// so both stay in identical order and the "first matching range" picked on
+/// release is the same element in both.
+#[derive(Default)]
+struct RangeModel {
+    spaces: HashMap<u64, Vec<(u64, KeyRange, LockMode)>>,
+}
+
+impl RangeModel {
+    fn apply_acquire(
+        &mut self,
+        txn: u64,
+        space: u64,
+        range: KeyRange,
+        mode: LockMode,
+    ) -> Result<(), LockError> {
+        let holders = self.spaces.entry(space).or_default();
+        let conflict = holders
+            .iter()
+            .any(|(t, r, m)| *t != txn && r.overlaps(range) && !m.compatible_with(mode));
+        if conflict {
+            return Err(LockError::Conflict);
+        }
+        holders.push((txn, range, mode));
+        Ok(())
+    }
+
+    fn apply_release(&mut self, txn: u64, space: u64, range: KeyRange) -> Result<(), LockError> {
+        if let Some(holders) = self.spaces.get_mut(&space) {
+            if let Some(pos) = holders
+                .iter()
+                .position(|(t, r, _)| *t == txn && *r == range)
+            {
+                let _ = holders.swap_remove(pos);
+                return Ok(());
+            }
+        }
+        Err(LockError::NotHeld)
+    }
+
+    fn assert_no_incompatible_overlap(&self) {
+        for holders in self.spaces.values() {
+            for i in 0..holders.len() {
+                for j in (i + 1)..holders.len() {
+                    let (ti, ri, mi) = holders[i];
+                    let (tj, rj, mj) = holders[j];
+                    if ti != tj && ri.overlaps(rj) {
+                        assert!(
+                            mi.compatible_with(mj),
+                            "incompatible overlapping ranges: {ri:?}/{mi:?} and {rj:?}/{mj:?}",
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(400))]
+
+    /// The range-lock facility agrees with the reference model after every
+    /// operation, and never lets two transactions hold overlapping ranges in
+    /// incompatible modes.
+    #[test]
+    fn range_manager_matches_model(
+        ops in proptest::collection::vec(range_op_strategy(), 1..200),
+    ) {
+        let lm = LockManager::with_shards(4);
+        let mut model = RangeModel::default();
+
+        for op in ops {
+            match op {
+                RangeOp::Acquire { txn, space, range, mode } => {
+                    let want = model.apply_acquire(txn, space, range, mode);
+                    let got = lm.try_acquire_range(TxnId::new(txn), ResourceId::new(space), range, mode);
+                    prop_assert_eq!(got, want, "acquire mismatch on {:?}", op);
+                }
+                RangeOp::Release { txn, space, range } => {
+                    let want = model.apply_release(txn, space, range);
+                    let got = lm.release_range(TxnId::new(txn), ResourceId::new(space), range);
+                    prop_assert_eq!(got, want, "release mismatch on {:?}", op);
+                }
+            }
+
+            model.assert_no_incompatible_overlap();
+
+            for s in 0..SPACES {
+                let expected = model.spaces.get(&s).map_or(0, Vec::len);
+                prop_assert_eq!(lm.range_count(ResourceId::new(s)), expected);
             }
         }
     }

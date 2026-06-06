@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "lock-db"
-version = "0.2.0"
+version = "0.3.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -92,6 +92,35 @@ proptest  = "1"
 # It is pulled in only when building with `RUSTFLAGS="--cfg loom"`.
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
+
+
+# EXAMPLES
+# #################################
+# Every example drives `LockManager`, which is behind the `std` feature, so they
+# are skipped in a `no_std` build rather than failing to compile.
+[[example]]
+name              = "quick_start"
+required-features = ["std"]
+
+[[example]]
+name              = "two_phase_locking"
+required-features = ["std"]
+
+[[example]]
+name              = "shared_upgrade"
+required-features = ["std"]
+
+[[example]]
+name              = "concurrent"
+required-features = ["std"]
+
+[[example]]
+name              = "hierarchy"
+required-features = ["std"]
+
+[[example]]
+name              = "range_locks"
+required-features = ["std"]
 
 
 # BENCHMARKS

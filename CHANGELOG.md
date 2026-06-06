@@ -9,6 +9,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-05
+
+Multi-granularity and range locking. This release extends the lock-table core
+with the full MGL mode set and lattice upgrades, and adds key-range locks for
+phantom protection. Acquisition remains `try`-style; wait queues and deadlock
+detection follow in later 0.x releases.
+
+### Added
+
+- Three new `LockMode` variants — `IntentionShared` (IS), `IntentionExclusive`
+  (IX), and `SharedIntentionExclusive` (SIX) — completing the standard MGL mode
+  set, with the full compatibility matrix.
+- `LockMode::join` (lattice least upper bound) and `LockMode::is_intention`.
+- `KeyRange` — an inclusive `[start, end]` key interval with `new`, `point`,
+  `start`, `end`, `contains`, and `overlaps`.
+- `LockManager::try_acquire_range`, `release_range`, and `range_count` for
+  range locking with overlap-based conflict detection, sharded by key space.
+- Examples `hierarchy` (multi-granularity protocol) and `range_locks` (phantom
+  protection); property and `loom` coverage for range locks; a range benchmark.
+
+### Changed
+
+- `LockManager::try_acquire` upgrades now resolve to the lattice join of the
+  held and requested modes (e.g. `Shared` + `IntentionExclusive` → `SIX`),
+  granted when the joined mode is compatible with every other holder.
+- `LockManager::release_all` now releases a transaction's range locks as well as
+  its point locks, and counts both.
+
 ## [0.2.0] - 2026-06-05
 
 The lock-table core. This release implements the compatibility matrix and a
@@ -52,6 +80,7 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` (Node 24 actions; fmt, clippy, test, doc, audit, deny) and `.github/FUNDING.yml`.
 
 <!-- LINKS -->
-[Unreleased]: https://github.com/jamesgober/lock-db/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lock-db/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/jamesgober/lock-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/lock-db/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/lock-db/releases/tag/v0.1.0

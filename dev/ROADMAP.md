@@ -23,10 +23,10 @@ Exit criteria:
 
 ---
 
-## v0.3.0 -- hierarchical granularities + intention locks + range locks
+## v0.3.0 -- hierarchical granularities + intention locks + range locks (DONE)
 
 Exit criteria:
-- [ ] New surface tested; hot paths benchmarked.
+- [x] New surface tested; hot paths benchmarked.
 
 ---
 
