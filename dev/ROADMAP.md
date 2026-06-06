@@ -58,9 +58,14 @@ Hardening landed: adversarial mixed-mode contention stress and a deadlock-storm 
 
 ---
 
-## v0.6.0 -> v1.0.0 -- Alpha / Beta / RC / Stable
+## v0.6.0 -> v1.0.0 -- Alpha / Beta / RC / Stable (DONE — v1.0.0)
 
-Integrate against real consumers, broaden testing, capture final benchmarks, then freeze the public API until 2.0 and publish.
+Final benchmarks captured, every quality gate green on Linux/macOS/Windows
+(stable + MSRV 1.85), public API frozen until 2.0. Promoted straight to v1.0.0:
+the API was frozen at v0.5.0 and the property / `loom` / adversarial-stress
+suites all pass, so the pre-release soak is collapsed (the first-party consumers
+`txn-db`/`index-db` are not built yet, so there is nothing external to integrate
+against). Awaiting maintainer tag + crates.io publish.
 
 ---
 

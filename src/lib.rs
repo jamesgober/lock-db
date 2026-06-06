@@ -12,9 +12,9 @@
 //!
 //! ## What is in this release
 //!
-//! This is the v0.4.0 milestone, which completes the feature set and freezes the
-//! public API ahead of 1.0. It adds wait-for deadlock detection on top of the
-//! multi-granularity and range locking from earlier releases:
+//! This is v1.0.0 — the stable release. The public API is frozen until 2.0. The
+//! crate provides multi-granularity locking, range locking, and wait-for
+//! deadlock detection:
 //!
 //! - [`LockMode`] — the five standard MGL modes (IS, IX, S, SIX, X) and their
 //!   compatibility matrix, plus the lattice [join](LockMode::join) that drives

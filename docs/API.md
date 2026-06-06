@@ -16,12 +16,11 @@
 
 > Complete reference for every public item in `lock-db`, with examples.
 >
-> **Version: 0.5.0 — feature-complete, API frozen until 2.0.** The full surface
-> is in place: the five MGL modes, hierarchical and range locks, and wait-for
-> deadlock detection (the deadlock-aware [`request`](#lockmanagerrequest) and the
-> standalone [`WaitForGraph`](#waitforgraph)). v0.5.0 hardens it with adversarial
-> contention and deadlock-storm stress tests; the public API will not change
-> before 2.0 (see [`dev/ROADMAP.md`](../dev/ROADMAP.md)).
+> **Version: 1.0.0 — stable.** The public API is frozen until 2.0. The full
+> surface is in place: the five MGL modes, hierarchical and range locks, and
+> wait-for deadlock detection (the deadlock-aware [`request`](#lockmanagerrequest)
+> and the standalone [`WaitForGraph`](#waitforgraph)), verified by property,
+> `loom`, and adversarial stress suites.
 
 ## Table of Contents
 
@@ -91,14 +90,14 @@ types:
 
 ```toml
 [dependencies]
-lock-db = "0.5"
+lock-db = "1"
 ```
 
 To enable `serde` derives on the public types:
 
 ```toml
 [dependencies]
-lock-db = { version = "0.5", features = ["serde"] }
+lock-db = { version = "1", features = ["serde"] }
 ```
 
 MSRV: Rust 1.85 (2024 edition).

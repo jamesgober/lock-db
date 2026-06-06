@@ -9,6 +9,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-06
+
+First stable release. The public API is frozen until 2.0. No code changes from
+v0.5.0 — this release captures the final benchmarks, confirms every quality gate
+on Linux, macOS, and Windows (stable and MSRV 1.85), and promotes the crate to
+1.0.
+
+The complete, stable surface:
+
+- Core (`no_std`): `LockMode`, `KeyRange`, `TxnId`, `ResourceId`, `LockError`.
+- `std`: `LockManager`, `Acquisition`, `WaitForGraph`, `VictimPolicy`,
+  `Deadlock`, and the `prelude`.
+
+### Changed
+
+- Version promoted to 1.0.0; the public API is stable and will not change before
+  a 2.0 major release.
+
 ## [0.5.0] - 2026-06-05
 
 Hardening and the formal API freeze. No new public surface — the feature set
@@ -133,7 +151,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` (Node 24 actions; fmt, clippy, test, doc, audit, deny) and `.github/FUNDING.yml`.
 
 <!-- LINKS -->
-[Unreleased]: https://github.com/jamesgober/lock-db/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lock-db/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/lock-db/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/jamesgober/lock-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/lock-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/lock-db/compare/v0.2.0...v0.3.0
