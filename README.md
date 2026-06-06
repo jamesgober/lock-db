@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Row/range locks. Hierarchical granularity. Wait-for deadlock detection.
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development.</strong> This is the <code>v0.1.0</code> scaffold &mdash; structure, tooling, and CI gates are in place; the implementation lands across the 0.x series per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. The public API is frozen at <code>1.0.0</code>.
+        <strong>Status: pre-1.0, in active development.</strong> <code>v0.2.0</code> ships the lock-table core &mdash; shared/exclusive modes, the compatibility matrix, and a sharded, non-blocking lock table with acquire, release, and shared-to-exclusive upgrade. Hierarchical and range locks, wait queues, and wait-for deadlock detection land across the rest of the 0.x series per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>. The public API is frozen at <code>1.0.0</code>.
     </blockquote>
 </div>
 
@@ -38,12 +38,18 @@
 
 <h2>What it does</h2>
 
-- **Lock modes** &mdash; shared (S), exclusive (X), and intention locks (IS, IX, SIX) with a full compatibility matrix
-- **Multiple granularities** &mdash; database, table, page, and row-level locks with intention-lock coupling
-- **Row and range locks** &mdash; lock individual keys or key ranges (for predicate / phantom protection)
-- **Lock table** &mdash; a sharded, contention-aware table mapping resources to their lock queues
+In this release (`v0.2.0`):
+
+- **Lock modes** &mdash; shared (S) and exclusive (X), with a `const` compatibility matrix at the core of every grant decision
+- **Sharded lock table** &mdash; the resource space is partitioned across independent shards so acquisitions on unrelated resources never contend on the same mutex
+- **Acquire / release** &mdash; non-blocking `try_acquire`, single and bulk release, re-entrant acquisition, and shared-to-exclusive upgrade of a sole holder
+
+Planned across the rest of the 0.x series (see [`dev/ROADMAP.md`](./dev/ROADMAP.md)):
+
+- **Hierarchical granularities** &mdash; database, table, page, and row-level locks with intention modes (IS, IX, SIX)
+- **Row and range locks** &mdash; lock individual keys or key ranges for predicate / phantom protection
+- **Wait / grant queues** &mdash; fair, blocking acquisition with upgrade handling
 - **Deadlock detection** &mdash; a wait-for graph with cycle detection and configurable victim selection
-- **Wait / grant queues** &mdash; fair queuing with upgrade handling (S to X)
 
 <br>
 <hr>
@@ -53,19 +59,69 @@
 
 ```toml
 [dependencies]
-lock-db = "0.1"
+lock-db = "0.2"
+```
+
+<br>
+
+## Quick Start
+
+```rust
+use lock_db::prelude::*;
+
+// One manager, shared across all worker threads behind an `Arc`.
+let lm = LockManager::new();
+let row = ResourceId::new(1);
+let (writer, reader) = (TxnId::new(1), TxnId::new(2));
+
+// The writer takes the row exclusively.
+lm.try_acquire(writer, row, LockMode::Exclusive).unwrap();
+
+// A concurrent reader is refused while the write lock is held.
+assert_eq!(lm.try_acquire(reader, row, LockMode::Shared), Err(LockError::Conflict));
+
+// Once the writer commits and releases, the reader gets in.
+lm.release(writer, row).unwrap();
+lm.try_acquire(reader, row, LockMode::Shared).unwrap();
+```
+
+A transaction drops its whole lock set in one call at commit or abort:
+
+```rust
+use lock_db::prelude::*;
+
+let lm = LockManager::new();
+let txn = TxnId::new(1);
+for id in 0..3 {
+    lm.try_acquire(txn, ResourceId::new(id), LockMode::Exclusive).unwrap();
+}
+assert_eq!(lm.release_all(txn), 3);
 ```
 
 <br>
 
 ## API Overview
 
-For the complete reference, see [`docs/API.md`](./docs/API.md).
+For the complete reference with method tables and examples, see [`docs/API.md`](./docs/API.md).
 
-- [`Lock modes`](./docs/API.md)
-- [`Multiple granularities`](./docs/API.md)
-- [`Row and range locks`](./docs/API.md)
-- [`Lock table`](./docs/API.md)
+- [`LockMode`](./docs/API.md#lockmode) &mdash; modes and the compatibility matrix
+- [`LockManager`](./docs/API.md#lockmanager) &mdash; the sharded lock table
+- [`TxnId` and `ResourceId`](./docs/API.md#identifiers) &mdash; opaque identifiers
+- [`LockError`](./docs/API.md#lockerror) &mdash; failure modes
+
+<br>
+
+## Examples
+
+Runnable examples live in [`examples/`](./examples). Run any of them with
+`cargo run --example <name>`:
+
+| Example | Shows |
+|---------|-------|
+| [`quick_start`](./examples/quick_start.rs) | Acquire, conflict, release on a single row. |
+| [`two_phase_locking`](./examples/two_phase_locking.rs) | Growing-phase acquires, then `release_all` at commit. |
+| [`shared_upgrade`](./examples/shared_upgrade.rs) | Read under a shared lock, then upgrade to exclusive. |
+| [`concurrent`](./examples/concurrent.rs) | Many threads contending on one row, with a mutual-exclusion check. |
 
 <br>
 <hr>

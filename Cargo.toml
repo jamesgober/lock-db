@@ -9,7 +9,7 @@
 #╚═══════════════════════════════╝
 [package]
 name    = "lock-db"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -58,6 +58,14 @@ name = "lock_db"
 path = "src/lib.rs"
 
 
+# LINTS
+# #################################
+# `loom` is set via RUSTFLAGS for the concurrency model checks (not a Cargo
+# feature), so it must be declared here or `-D warnings` rejects the cfg.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+
 # FEATURE FLAGS
 # #################################
 [features]
@@ -79,7 +87,10 @@ serde = { version = "1", optional = true, default-features = false, features = [
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
 
-[target.'cfg(loom)'.dev-dependencies]
+# loom is a normal (not dev) dependency under `cfg(loom)` because the library
+# itself swaps in loom's instrumented `Mutex` for the concurrency model checks.
+# It is pulled in only when building with `RUSTFLAGS="--cfg loom"`.
+[target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
 
