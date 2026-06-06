@@ -9,6 +9,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-06-05
+
+Hardening and the formal API freeze. No new public surface — the feature set
+frozen at v0.4.0 is now exercised under adversarial load, and the public API is
+recorded as frozen until 2.0.
+
+### Added
+
+- Adversarial contention stress test: many threads hammering a shared resource
+  pool with random shared/exclusive acquisitions, verifying mutual exclusion
+  through an independent per-resource counter.
+- Deadlock-storm stress test: many threads acquiring resource pairs in random
+  order via `request`, asserting that detect-and-abort keeps every transaction
+  making progress (a liveness check that fails loudly rather than hanging).
+
+### Changed
+
+- **Public API frozen.** The surface is stable until 2.0; remaining 0.x releases
+  integrate against real consumers and capture final benchmarks. `cargo audit`
+  and `cargo deny` are clean.
+
 ## [0.4.0] - 2026-06-05
 
 Wait-for deadlock detection, and the feature freeze. This release completes the
@@ -112,7 +133,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` (Node 24 actions; fmt, clippy, test, doc, audit, deny) and `.github/FUNDING.yml`.
 
 <!-- LINKS -->
-[Unreleased]: https://github.com/jamesgober/lock-db/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lock-db/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/jamesgober/lock-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/lock-db/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/jamesgober/lock-db/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/jamesgober/lock-db/compare/v0.1.0...v0.2.0

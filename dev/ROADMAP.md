@@ -43,10 +43,18 @@ formal API freeze.
 
 ---
 
-## v0.5.0 -- adversarial contention + deadlock-storm tests + API freeze
+## v0.5.0 -- adversarial contention + deadlock-storm tests + API freeze (DONE)
 
 Exit criteria:
-- [ ] Public API frozen (recorded here). `cargo audit` + `cargo deny` clean.
+- [x] Public API frozen (recorded here). `cargo audit` + `cargo deny` clean.
+
+**Public API frozen as of v0.5.0** (no changes until 2.0):
+
+- Core (`no_std`): `LockMode` (+ `compatible_with`/`join`/`covers`/`is_exclusive`/`is_intention`), `KeyRange` (+ `new`/`point`/`start`/`end`/`contains`/`overlaps`), `TxnId`, `ResourceId`, `LockError` (`Conflict`/`NotHeld`, `#[non_exhaustive]`).
+- `std`: `LockManager` (`new`/`with_shards`/`try_acquire`/`release`/`release_all`/`try_acquire_range`/`release_range`/`request`/`cancel_wait`/`find_deadlock`/`holder_count`/`mode_held`/`range_count`/`waiting_count`/`shards`), `Acquisition`, `WaitForGraph`, `VictimPolicy`, `Deadlock`.
+- `prelude` re-exports the above.
+
+Hardening landed: adversarial mixed-mode contention stress and a deadlock-storm liveness test (`tests/stress.rs`), on top of the property and `loom` suites.
 
 ---
 

@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Row/range locks. Hierarchical granularity. Wait-for deadlock detection.
     </p>
     <blockquote>
-        <strong>Status: feature-complete, API frozen.</strong> As of <code>v0.4.0</code> the feature set is complete and the public API is frozen ahead of <code>1.0.0</code>: the five MGL modes, hierarchical and range locks, and wait-for deadlock detection are all in place. The remaining 0.x work is hardening and soak testing per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: feature-complete, API frozen, hardening.</strong> The feature set is complete and the public API is frozen until <code>2.0</code>: the five MGL modes, hierarchical and range locks, and wait-for deadlock detection. <code>v0.5.0</code> adds adversarial contention and deadlock-storm stress tests on top of the property and <code>loom</code> suites. The remaining road to <code>1.0.0</code> is integration and final benchmarks per <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
     </blockquote>
 </div>
 
@@ -53,7 +53,7 @@
 
 ```toml
 [dependencies]
-lock-db = "0.4"
+lock-db = "0.5"
 ```
 
 <br>
