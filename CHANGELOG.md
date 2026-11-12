@@ -9,6 +9,70 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-11
+
+Fixes from an independent review: the deadlock-aware path no longer
+serializes on one global mutex or rebuilds the wait-for graph on every call, a
+deadlock victim is fenced until it has rolled back, and `request` grants in
+first-in, first-out order. Additive to the 1.0 API; no MSRV change.
+
+### Added
+
+- `LockError::Aborted`, returned by `try_acquire` and `try_acquire_range` for a
+  transaction chosen as a deadlock victim that has not been released since.
+- `LockManager::is_aborted(txn)`, so a victim's own thread can ask whether it
+  was chosen.
+
+### Changed
+
+- `request` keeps a first-in, first-out wait queue per resource. A request is
+  granted only when it is compatible with every holder and with every
+  transaction queued ahead of it, so a waiting writer is no longer overtaken by
+  a stream of newer readers. Upgraders queue ahead of transactions that hold
+  nothing on the resource. A `request` that 1.0 granted by overtaking a queued,
+  conflicting waiter now returns `Waiting`. `try_acquire` is unchanged and does
+  not consult the queue.
+- A deadlock victim is marked when `request` or `find_deadlock` names it. Its
+  next `request` returns `Acquisition::Deadlock` naming itself and its next
+  `try_acquire` / `try_acquire_range` returns `LockError::Aborted`, until it
+  calls `release_all` on itself after being told. Releasing it from another
+  thread frees its locks but keeps the mark; a second `release_all` (the
+  victim's own, if it gives up without asking) clears it too, so no mark is left
+  behind. In 1.0 the victim's thread was
+  never told and a later `request` handed it fresh locks after it had lost the
+  earlier ones.
+- Re-acquiring a range lock is idempotent: a request inside a range already
+  held in a covering mode changes nothing, and a request for exactly a held
+  range upgrades it in place to the join. In 1.0 each call added another
+  holder, so a retry loop grew the space without bound.
+
+### Performance
+
+- Deadlock detection walks only the wait-for edges reachable from the new
+  waiter, reading each edge from the lock table as it is reached, instead of
+  rebuilding the whole graph under a global mutex on every conflicting call.
+  The global wait mutex is gone: waits live in a table sharded by transaction
+  id, and no global lock is held across a walk. A conflicting `request` with
+  5,000 unrelated waiters went from 0.95 ms to 0.7 us.
+- `find_deadlock` and `WaitForGraph::detect_cycle` share one visited set across
+  every starting node and are linear in the size of the graph (was quadratic).
+  A 2,000-waiter acyclic chain went from 234 ms to 0.74 ms.
+- `release_all` visits only the shards the transaction holds locks in (tracked
+  per transaction), not every shard. Acquire one lock plus `release_all` at
+  1,024 shards went from 39 us to 0.39 us. Recording the shards costs about
+  50 to 70 ns on a transaction's first lock in a shard and its last release
+  there.
+
+### Fixed
+
+- Documentation: the module docs no longer say deadlock detection arrives in a
+  later milestone; the "exact detection" claim now states its precondition
+  (every abandoned wait is cleared with `cancel_wait` or `release_all`);
+  `release_all` cost is described correctly; the README no longer says txn-db,
+  page-db, and index-db use lock-db (none does); `LockMode` documents that its
+  `Ord` is declaration order, not the privilege lattice; `VictimPolicy` notes
+  that a restarted transaction with a new, larger id is the youngest again.
+
 ## [1.0.0] - 2026-06-06
 
 First stable release. The public API is frozen until 2.0. No code changes from
@@ -151,7 +215,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` (Node 24 actions; fmt, clippy, test, doc, audit, deny) and `.github/FUNDING.yml`.
 
 <!-- LINKS -->
-[Unreleased]: https://github.com/jamesgober/lock-db/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lock-db/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/jamesgober/lock-db/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/jamesgober/lock-db/compare/v0.5.0...v1.0.0
 [0.5.0]: https://github.com/jamesgober/lock-db/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/jamesgober/lock-db/compare/v0.3.0...v0.4.0

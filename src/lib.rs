@@ -12,9 +12,9 @@
 //!
 //! ## What is in this release
 //!
-//! This is v1.0.0 — the stable release. The public API is frozen until 2.0. The
-//! crate provides multi-granularity locking, range locking, and wait-for
-//! deadlock detection:
+//! This is the stable 1.x line. The public API is stable until 2.0; 1.x
+//! releases only add to it. The crate provides multi-granularity locking, range
+//! locking, first-in, first-out wait queues, and wait-for deadlock detection:
 //!
 //! - [`LockMode`] — the five standard MGL modes (IS, IX, S, SIX, X) and their
 //!   compatibility matrix, plus the lattice [join](LockMode::join) that drives
@@ -28,14 +28,17 @@
 //! - [`KeyRange`] — an inclusive key interval, the unit a range lock protects
 //!   (phantom / predicate protection).
 //! - [`TxnId`] and [`ResourceId`] — opaque identifiers the caller assigns.
-//! - [`LockError`] — the small, exhaustive set of ways an operation can fail.
+//! - [`LockError`]: the small set of ways an operation can fail, including
+//!   [`LockError::Aborted`] for a transaction chosen as a deadlock victim.
 //!
 //! [`try_acquire`](LockManager::try_acquire) is the non-blocking fast path: a
 //! request that cannot be granted returns [`LockError::Conflict`] and is not
 //! tracked. [`request`](LockManager::request) is the deadlock-aware path: a
-//! request that cannot be granted is recorded in the wait-for graph and reports
+//! request that cannot be granted joins the resource's first-in, first-out wait
+//! queue, is recorded in the wait-for graph, and reports
 //! [`Acquisition::Waiting`] or, if it closes a cycle,
-//! [`Acquisition::Deadlock`]. lock-db detects deadlocks and names a victim; the
+//! [`Acquisition::Deadlock`]. lock-db detects deadlocks, names a victim, and
+//! refuses the victim's further acquisitions until it is released; the
 //! transaction layer above suspends, retries, and aborts.
 //!
 //! ## Hierarchical locking

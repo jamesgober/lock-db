@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). Row/range locks. Hierarchical granularity. Wait-for deadlock detection.
     </p>
     <blockquote>
-        <strong>Status: stable.</strong> <code>v1.0.0</code> — the public API is frozen until <code>2.0</code>. The feature set is complete (the five MGL modes, hierarchical and range locks, and wait-for deadlock detection), verified by property, <code>loom</code>, and adversarial-contention / deadlock-storm stress suites, and green across Linux, macOS, and Windows.
+        <strong>Status: stable.</strong> <code>v1.1.0</code>. The public API is stable until <code>2.0</code>; 1.x releases only add to it. The feature set is complete (the five MGL modes, hierarchical and range locks, wait queues, and wait-for deadlock detection), verified by property, <code>loom</code>, and adversarial-contention / deadlock-storm stress suites, and green across Linux, macOS, and Windows.
     </blockquote>
 </div>
 
@@ -41,7 +41,7 @@
 - **Lock modes** &mdash; the five standard multi-granularity modes &mdash; intention-shared (IS), intention-exclusive (IX), shared (S), shared-intention-exclusive (SIX), and exclusive (X) &mdash; with a `const` compatibility matrix at the core of every grant decision
 - **Hierarchical granularities** &mdash; lock a database / table / page / row hierarchy correctly with intention locks; the manager enforces the matrix at every level
 - **Range locks** &mdash; lock a contiguous span of keys (`KeyRange`) for predicate / phantom protection, with overlap-based conflict detection
-- **Deadlock detection** &mdash; a wait-for graph with cycle detection and victim selection; the deadlock-aware `request` records waits and reports cycles, and `WaitForGraph` is reusable on its own
+- **Deadlock detection**: a wait-for graph with cycle detection and victim selection; the deadlock-aware `request` queues waits first in, first out, checks only the part of the graph the new wait can reach, and fences the chosen victim until it has rolled back; `WaitForGraph` is reusable on its own
 - **Sharded lock table** &mdash; the resource space is partitioned across independent shards so acquisitions on unrelated resources never contend on the same mutex
 - **Acquire / release** &mdash; non-blocking `try_acquire`, single and bulk release, re-entrant acquisition, and lattice upgrades (e.g. S + IX &rarr; SIX)
 
@@ -130,6 +130,11 @@ if let Acquisition::Deadlock(d) = lm.request(t2, a, LockMode::Exclusive) {
 }
 ```
 
+When the victim is another transaction, its own thread is told on its next call:
+`request` returns `Acquisition::Deadlock` naming it, and `try_acquire` returns
+`LockError::Aborted`, until it rolls back and calls `release_all` on itself.
+`is_aborted` lets it ask directly.
+
 <br>
 
 ## API Overview
@@ -166,14 +171,15 @@ Runnable examples live in [`examples/`](./examples). Run any of them with
 
 ## Where It Fits
 
-`lock-db` is the concurrency-control layer. It is used by:
+`lock-db` is a pessimistic concurrency-control layer for a transaction or
+storage engine to build on. No published crate in this collection depends on it
+yet: [`txn-db`](https://github.com/jamesgober/txn-db) uses optimistic multi-version
+concurrency control instead, and [`page-db`](https://github.com/jamesgober/page-db)
+and [`index-db`](https://github.com/jamesgober/index-db) do not take locks from it.
+Typical uses are row and table locks for two-phase locking, page locks over a
+paged store, and range locks over B+tree key ranges for phantom protection.
 
-- [`txn-db`](https://github.com/jamesgober/txn-db) &mdash; transactions acquire and release locks here to enforce isolation
-- [`page-db`](https://github.com/jamesgober/page-db) &mdash; page-granularity locks coordinate with the paged store
-- [`index-db`](https://github.com/jamesgober/index-db) &mdash; range locks protect B+tree key ranges against phantoms
-- storage engines &mdash; any engine needing pessimistic concurrency control
-
-It has no first-party dependencies, so it builds and tests standalone today.
+It has no first-party dependencies, so it builds and tests standalone.
 
 <br>
 

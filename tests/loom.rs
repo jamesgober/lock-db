@@ -151,3 +151,36 @@ fn loom_two_transaction_deadlock_is_always_resolved() {
         assert!(lm.find_deadlock().is_none());
     });
 }
+
+/// Two writers race through `request` on one free resource. Exactly one is
+/// granted; the other is queued. Once the winner releases, the loser's retry is
+/// granted, and no queue entry or wait is left behind under any interleaving.
+/// This also checks the resource-shard / transaction-shard lock ordering.
+#[test]
+fn loom_request_queue_hands_over_cleanly() {
+    loom::model(|| {
+        let lm = Arc::new(LockManager::with_shards(2));
+        let res = ResourceId::new(1);
+        let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+
+        let lm2 = Arc::clone(&lm);
+        let other = loom::thread::spawn(move || lm2.request(t2, res, LockMode::Exclusive));
+        let mine = lm.request(t1, res, LockMode::Exclusive);
+        let theirs = other.join().unwrap();
+
+        let (winner, loser) = match (mine, theirs) {
+            (Acquisition::Granted, Acquisition::Waiting) => (t1, t2),
+            (Acquisition::Waiting, Acquisition::Granted) => (t2, t1),
+            other => panic!("expected one grant and one wait, got {other:?}"),
+        };
+        assert_eq!(lm.waiting_count(), 1);
+        assert_eq!(lm.release_all(winner), 1);
+        assert_eq!(
+            lm.request(loser, res, LockMode::Exclusive),
+            Acquisition::Granted
+        );
+        assert_eq!(lm.waiting_count(), 0);
+        assert_eq!(lm.release_all(loser), 1);
+        assert_eq!(lm.holder_count(res), 0);
+    });
+}

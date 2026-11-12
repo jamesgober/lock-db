@@ -16,9 +16,10 @@
 
 > Complete reference for every public item in `lock-db`, with examples.
 >
-> **Version: 1.0.0 — stable.** The public API is frozen until 2.0. The full
-> surface is in place: the five MGL modes, hierarchical and range locks, and
-> wait-for deadlock detection (the deadlock-aware [`request`](#lockmanagerrequest)
+> **Version: 1.1.0, stable.** The public API is stable until 2.0; 1.x releases
+> only add to it. The full surface is in place: the five MGL modes, hierarchical
+> and range locks, first-in, first-out wait queues, and wait-for deadlock
+> detection with victim fencing (the deadlock-aware [`request`](#lockmanagerrequest)
 > and the standalone [`WaitForGraph`](#waitforgraph)), verified by property,
 > `loom`, and adversarial stress suites.
 
@@ -42,6 +43,7 @@
     - [`request`](#lockmanagerrequest)
     - [`cancel_wait`](#lockmanagercancel_wait)
     - [`find_deadlock`](#lockmanagerfind_deadlock)
+    - [`is_aborted`](#lockmanageris_aborted)
     - [`holder_count`](#lockmanagerholder_count)
     - [`mode_held`](#lockmanagermode_held)
     - [`range_count`](#lockmanagerrange_count)
@@ -163,9 +165,16 @@ the same way, by the key space they protect. Pick the shard count with
 [`with_shards`](#lockmanagerwith_shards), or let [`new`](#lockmanagernew) scale
 it to the machine.
 
-Acquisition in this release is **non-blocking**: a request that cannot be
-granted returns [`LockError::Conflict`](#lockerror) immediately rather than
-parking the thread. The caller decides whether to retry, wait, or abort.
+A second, smaller table, sharded by transaction id, records for each
+transaction the shards it holds locks in and the resource it is waiting for. The
+deadlock-aware [`request`](#lockmanagerrequest) uses it instead of a global
+mutex, and [`release_all`](#lockmanagerrelease_all) uses it to visit only the
+shards the transaction used.
+
+Acquisition is **non-blocking**: [`try_acquire`](#lockmanagertry_acquire)
+returns [`LockError::Conflict`](#lockerror) immediately, and
+[`request`](#lockmanagerrequest) returns `Waiting`, rather than parking the
+thread. The caller decides whether to retry, wait, or abort.
 
 ---
 
@@ -218,8 +227,10 @@ assert!(lm.try_acquire(reader, row, LockMode::Shared).is_err());
 on conflict the caller is free to retry, but the manager has no idea who is
 waiting for whom, so it cannot tell a transient conflict from a genuine
 deadlock. [`request`](#lockmanagerrequest) is the deadlock-aware path. On
-conflict it records, in a **wait-for graph**, that the requesting transaction is
-waiting for the current holders, then checks whether that closed a cycle.
+conflict it puts the transaction in the resource's first-in, first-out wait
+queue, records it as waiting, and checks whether that closed a cycle in the
+**wait-for graph**. A waiter waits for every holder in a conflicting mode and
+for every conflicting waiter queued ahead of it.
 
 - No cycle → [`Acquisition::Waiting`]. The caller suspends the transaction (with
   its own scheduler) and calls `request` again later to retry.
@@ -229,15 +240,31 @@ waiting for the current holders, then checks whether that closed a cycle.
   wait, breaking the cycle.
 
 lock-db does not park threads; the transaction layer owns suspension and retry.
-Detection is **exact**: the graph is rebuilt from the current lock table on every
-check, so a wait left over from a since-released lock contributes no edge, and a
-transaction is never reported as deadlocked unless it genuinely is.
+The edges are read from the current lock table as the search reaches each
+waiter, so a wait left over from a since-released lock contributes no edge.
+Detection is exact provided every abandoned wait is cleared: a transaction that
+stops waiting must be granted, call [`cancel_wait`](#lockmanagercancel_wait), or
+be released with [`release_all`](#lockmanagerrelease_all). A wait that is simply
+dropped still counts, keeps blocking the waiters queued behind it, and can close
+a cycle that no live transaction is in.
 
 Two detection modes share this machinery: [`request`](#lockmanagerrequest)
-detects at the moment a wait is added (responsive), and
-[`find_deadlock`](#lockmanagerfind_deadlock) scans the whole wait set on demand
-(for a periodic background detector). The wait-for graph itself is exposed as
-[`WaitForGraph`](#waitforgraph) for direct use and testing.
+detects at the moment a wait is added, walking only the edges reachable from the
+new waiter, and [`find_deadlock`](#lockmanagerfind_deadlock) scans the whole
+wait set on demand (for a periodic background detector) in one pass that visits
+each waiter once. Neither holds a global lock across the walk. The wait-for
+graph itself is exposed as [`WaitForGraph`](#waitforgraph) for direct use and
+testing.
+
+**Victim fencing.** The victim a check names is marked. When it is not the
+transaction whose call found the deadlock, its own thread has not been told, so
+the manager refuses its next acquisition: `request` returns
+`Acquisition::Deadlock` naming it, and `try_acquire` / `try_acquire_range`
+return [`LockError::Aborted`](#lockerror). [`is_aborted`](#lockmanageris_aborted)
+reports the same thing. Releasing the victim from another thread frees its
+locks but keeps the mark; the victim's own `release_all` clears it (the first
+one after it was told, or the second release since it was marked). A victim
+therefore cannot carry on with a lock set it has already lost.
 
 > Only transactions that wait through `request` appear in the graph. A
 > transaction that spins on `try_acquire` is invisible to detection, and range
@@ -350,10 +377,14 @@ granted and `Ok(())` returned when:
   holder.
 
 Otherwise nothing changes and `Err(LockError::Conflict)` is returned.
+`try_acquire` checks the current holders only; it does not wait its turn behind
+transactions queued through [`request`](#lockmanagerrequest).
 
 **Errors**
 
-- [`LockError::Conflict`](#lockerror) — the lock cannot be granted right now.
+- [`LockError::Conflict`](#lockerror): the lock cannot be granted right now.
+- [`LockError::Aborted`](#lockerror): `txn` was chosen as a deadlock victim and
+  has not been released since (see [victim fencing](#deadlock-detection)).
 
 **Examples**
 
@@ -439,11 +470,13 @@ assert_eq!(lm.release(t, key), Err(LockError::NotHeld));
 pub fn release_all(&self, txn: TxnId) -> usize
 ```
 
-Releases every lock held by `txn` across the whole table — **both point locks
-and range locks** — and returns how many were released. This is the call a
-transaction layer makes at commit or abort. It is proportional to the number of
-locks the transaction holds, not to the size of the table, because each shard
-maintains a reverse index from transaction to the locks it holds there.
+Releases every lock held by `txn` across the whole table (**both point locks
+and range locks**), clears any wait it has registered, and returns how many
+locks were released. This is the call a transaction layer makes at commit or
+abort. Its cost is proportional to the number of shards the transaction holds
+locks in, not to the size of the table or the shard count. Releasing a marked
+deadlock victim visits every shard, so a lock its own thread took concurrently
+cannot be missed; see [victim fencing](#deadlock-detection).
 
 **Examples**
 
@@ -478,6 +511,10 @@ conflict.
 
 The request is granted unless some **other** transaction already holds an
 [overlapping](#keyrange) range in `space` in an [incompatible](#lockmode) mode.
+Re-acquisition is idempotent: a request inside a range the transaction already
+holds in a covering mode changes nothing, and a request for exactly a range it
+holds upgrades that lock in place to the join of the two modes. Other ranges of
+the same transaction, including overlapping ones, stay separate locks.
 The same transaction may hold several ranges in a space, including overlapping
 ones; range locks are not merged or upgraded.
 
@@ -489,8 +526,10 @@ ones; range locks are not merged or upgraded.
 
 **Errors**
 
-- [`LockError::Conflict`](#lockerror) — an overlapping, incompatible range is
+- [`LockError::Conflict`](#lockerror): an overlapping, incompatible range is
   held by another transaction.
+- [`LockError::Aborted`](#lockerror): `txn` was chosen as a deadlock victim and
+  has not been released since.
 
 **Examples**
 
@@ -525,8 +564,8 @@ pub fn release_range(&self, txn: TxnId, space: ResourceId, range: KeyRange) -> R
 ```
 
 Releases a range lock `txn` holds over `range` in `space`. Matches on the
-transaction and the exact range; if the transaction holds several locks on the
-identical range (in different modes), one is released per call.
+transaction and the exact range. A transaction holds at most one lock on any
+exact range (re-acquiring it upgrades in place), so one call releases it.
 
 **Errors**
 
@@ -560,21 +599,33 @@ The deadlock-aware counterpart to [`try_acquire`](#lockmanagertry_acquire).
 Returns an [`Acquisition`](#acquisition):
 
 - `Granted` — the lock was granted; proceed.
-- `Waiting` — the lock is held incompatibly and `txn` is now recorded in the
+- `Waiting`: the lock is held incompatibly, or a transaction queued ahead
+  wants a conflicting mode, and `txn` is now queued and recorded in the
   wait-for graph. Suspend the transaction and call `request` again later. No
   deadlock was found.
-- `Deadlock(d)` — granting the wait would close a cycle. Abort `d.victim` with
+- `Deadlock(d)`: granting the wait would close a cycle. Abort `d.victim` with
   [`release_all`](#lockmanagerrelease_all). The victim may be `txn` or another
-  transaction in the cycle.
+  transaction in the cycle. The same outcome, naming `txn`, is returned when
+  `txn` was already chosen as a victim and has not been released.
+
+**Fairness.** Each resource has a first-in, first-out queue. A request is
+granted only when it is compatible with every holder and with every transaction
+queued ahead of it, so a waiting writer is not overtaken by newer readers. A
+transaction that already holds the resource and asks for a stronger mode queues
+ahead of transactions that hold nothing on it. A transaction waits on one
+resource at a time; a `request` for another resource moves its wait.
+[`try_acquire`](#lockmanagertry_acquire) does not consult the queue.
 
 The victim is chosen by the [`VictimPolicy::Youngest`](#victimpolicy-and-deadlock)
 policy; for a different policy, apply
 [`WaitForGraph::pick_victim`](#waitforgraph) to `d.cycle`. Only point locks taken
 through `request` participate in detection (see [Deadlock detection](#deadlock-detection)).
 
-> **Performance.** `request` serializes on a single wait-registry mutex, unlike
-> the sharded `try_acquire`. Use `try_acquire` when you do not need deadlock
-> detection, and `request` when you do.
+> **Performance.** `request` takes the resource's shard mutex and the
+> transaction's entry in the transaction table, both sharded. A grant costs about
+> the same as `try_acquire`. A wait also walks the wait-for edges reachable from
+> the new waiter, so its cost does not grow with unrelated waiters elsewhere in
+> the system.
 
 **Examples**
 
@@ -631,11 +682,13 @@ assert!(acquire_or_abort(&lm, TxnId::new(1), ResourceId::new(1), LockMode::Exclu
 pub fn cancel_wait(&self, txn: TxnId)
 ```
 
-Removes any pending wait for `txn` from the wait-for graph. Call this when a
-transaction that previously got [`Acquisition::Waiting`](#acquisition) stops
-waiting without acquiring the lock (for example a timeout).
-[`release_all`](#lockmanagerrelease_all) already clears the wait, so this is only
-needed when the transaction is releasing nothing.
+Removes any pending wait for `txn` from the wait-for graph and takes it out of
+the resource's wait queue. Call this when a transaction that previously got
+[`Acquisition::Waiting`](#acquisition) stops waiting without acquiring the lock
+(for example a timeout). [`release_all`](#lockmanagerrelease_all) already clears
+the wait, so this is only needed when the transaction is releasing nothing.
+Skipping it leaves the transaction queued, blocking later requests on the
+resource.
 
 **Example**
 
@@ -662,8 +715,9 @@ Scans the current wait set for a deadlock, returning one if found. This is the
 periodic-detection counterpart to the at-wait detection in
 [`request`](#lockmanagerrequest): a background task can call it on an interval
 instead of (or as well as) acting on `request`'s result. Like `request`, it
-rebuilds the graph from the current lock table, so it reports only genuine
-deadlocks.
+reads edges from the current lock table. It visits each waiter and edge once, so
+its cost is linear in the size of the wait-for graph, and it holds no global
+lock while it walks. The victim it names is marked, as for `request`.
 
 **Example**
 
@@ -679,6 +733,46 @@ assert!(lm.find_deadlock().is_none());
 lm.request(TxnId::new(2), a, LockMode::Exclusive); // T2 waits for T1: cycle
 let d = lm.find_deadlock().expect("a deadlock");
 assert_eq!(d.cycle.len(), 2);
+```
+
+---
+
+#### `LockManager::is_aborted`
+
+```rust
+pub fn is_aborted(&self, txn: TxnId) -> bool
+```
+
+Returns `true` if `txn` was chosen as a deadlock victim and has not been
+released since being told. A `true` answer counts as telling it: the victim
+rolls back and calls [`release_all`](#lockmanagerrelease_all) on itself, which
+clears the mark. A victim that gives up and releases itself without being told
+also clears it, if another thread had already released it. A caller that
+aborts some other transaction instead of the named victim leaves the victim
+marked until the victim next calls into the manager or is released twice.
+Added in 1.1.0.
+
+**Example**
+
+```rust
+use lock_db::{Acquisition, LockError, LockManager, LockMode, ResourceId, TxnId};
+
+let lm = LockManager::new();
+let (a, b) = (ResourceId::new(1), ResourceId::new(2));
+let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+lm.request(t2, a, LockMode::Exclusive);
+lm.request(t1, b, LockMode::Exclusive);
+lm.request(t2, b, LockMode::Exclusive); // T2 waits for T1
+
+// T1 closes the cycle; the victim is T2.
+let Acquisition::Deadlock(d) = lm.request(t1, a, LockMode::Exclusive) else { panic!() };
+lm.release_all(d.victim); // T1's thread aborts T2
+
+// T2's own thread is refused until it releases itself.
+assert_eq!(lm.try_acquire(t2, b, LockMode::Shared), Err(LockError::Aborted));
+assert!(lm.is_aborted(t2));
+lm.release_all(t2);
+assert!(!lm.is_aborted(t2));
 ```
 
 ---
@@ -807,8 +901,8 @@ pub enum Acquisition {
 | Variant | Meaning | Caller should |
 |---------|---------|---------------|
 | `Granted` | The lock is held. | Proceed. |
-| `Waiting` | Recorded as waiting; no cycle. | Suspend and retry `request` later. |
-| `Deadlock(Deadlock)` | The wait closes a cycle. | Abort [`Deadlock::victim`](#victimpolicy-and-deadlock). |
+| `Waiting` | Queued and recorded as waiting; no cycle. | Suspend and retry `request` later, or `cancel_wait`. |
+| `Deadlock(Deadlock)` | The wait closes a cycle, or the requester is an unreleased victim. | Abort [`Deadlock::victim`](#victimpolicy-and-deadlock). |
 
 `Acquisition` is `#[must_use]`: the whole point of the call is to act on which
 variant comes back.
@@ -843,7 +937,8 @@ use lock_db::WaitForGraph;
 | `is_empty` / `waiter_count` | — | Whether / how many transactions are waiting. |
 
 Detection uses an iterative depth-first search (no recursion, so a long wait
-chain cannot overflow the stack).
+chain cannot overflow the stack). `detect_cycle` shares one visited set across
+every starting node, so it is linear in the size of the graph.
 
 **Examples**
 
@@ -1065,15 +1160,15 @@ assert_eq!(u64::from(page), 0xDEAD_BEEF);
 ### `LockError`
 
 The set of ways a lock operation can fail. `#[non_exhaustive]`, so matching code
-must keep a wildcard arm; later milestones add variants (for example a timeout
-and a deadlock-victim signal). Implements `Display`, and `std::error::Error`
-under the `std` feature. `no_std`.
+must keep a wildcard arm; `Aborted` was added in 1.1.0. Implements `Display`,
+and `std::error::Error` under the `std` feature. `no_std`.
 
 ```rust
 #[non_exhaustive]
 pub enum LockError {
     Conflict,
     NotHeld,
+    Aborted,
 }
 ```
 
@@ -1081,6 +1176,7 @@ pub enum LockError {
 |---------|-------------|---------|
 | `Conflict` | [`try_acquire`](#lockmanagertry_acquire), [`try_acquire_range`](#lockmanagertry_acquire_range) | The lock cannot be granted without blocking. |
 | `NotHeld` | [`release`](#lockmanagerrelease), [`release_range`](#lockmanagerrelease_range) | No matching lock is held for this transaction. |
+| `Aborted` | [`try_acquire`](#lockmanagertry_acquire), [`try_acquire_range`](#lockmanagertry_acquire_range) | The transaction was chosen as a deadlock victim and must roll back and `release_all`. |
 
 **Example**
 

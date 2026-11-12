@@ -280,13 +280,29 @@ impl RangeModel {
         mode: LockMode,
     ) -> Result<(), LockError> {
         let holders = self.spaces.entry(space).or_default();
+        // Re-acquiring inside a range already held in a covering mode is a
+        // no-op.
+        let covered = holders.iter().any(|(t, r, m)| {
+            *t == txn && r.start() <= range.start() && range.end() <= r.end() && m.covers(mode)
+        });
+        if covered {
+            return Ok(());
+        }
+        // Re-acquiring an exact range already held upgrades it in place.
+        let same = holders
+            .iter()
+            .position(|(t, r, _)| *t == txn && *r == range);
+        let target = same.map_or(mode, |p| holders[p].2.join(mode));
         let conflict = holders
             .iter()
-            .any(|(t, r, m)| *t != txn && r.overlaps(range) && !m.compatible_with(mode));
+            .any(|(t, r, m)| *t != txn && r.overlaps(range) && !m.compatible_with(target));
         if conflict {
             return Err(LockError::Conflict);
         }
-        holders.push((txn, range, mode));
+        match same {
+            Some(p) => holders[p].2 = target,
+            None => holders.push((txn, range, mode)),
+        }
         Ok(())
     }
 
