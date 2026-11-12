@@ -126,8 +126,9 @@ fn stress_deadlock_storm_always_makes_progress() {
     let lm = Arc::new(LockManager::new());
     let next_txn = Arc::new(AtomicU64::new(1));
 
-    // Acquire two resources in the given order; abort (return false) on a
-    // detected deadlock or if waiting exhausts its spin budget. The caller
+    // Acquire two resources in the given order; abort (return false) when this
+    // transaction is a deadlock victim or if waiting exhausts its spin budget,
+    // and abort the named victim when it is another transaction. The caller
     // releases whatever was acquired.
     fn acquire_pair(
         lm: &LockManager,
@@ -142,7 +143,14 @@ fn stress_deadlock_storm_always_makes_progress() {
             loop {
                 match lm.request(txn, res, LockMode::Exclusive) {
                     Acquisition::Granted => break,
-                    Acquisition::Deadlock(_) => return false,
+                    // We are the victim (named here, or told on a retry).
+                    Acquisition::Deadlock(d) if d.victim == txn => return false,
+                    // Another transaction is the victim: abort it, as the
+                    // docs say, and keep trying. Its own thread is told on
+                    // its next call.
+                    Acquisition::Deadlock(d) => {
+                        let _ = lm.release_all(d.victim);
+                    }
                     Acquisition::Waiting => {
                         spins += 1;
                         if spins > spin_budget {
@@ -215,4 +223,9 @@ fn stress_deadlock_storm_always_makes_progress() {
         lm.find_deadlock().is_none(),
         "a deadlock survived the storm"
     );
+    // Every victim was told on its next request and released itself, so no
+    // victim mark is left behind.
+    for id in 1..next_txn.load(Ordering::Relaxed) {
+        assert!(!lm.is_aborted(TxnId::new(id)), "victim mark leaked: {id}");
+    }
 }

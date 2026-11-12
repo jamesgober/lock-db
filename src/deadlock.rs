@@ -10,9 +10,9 @@
 //! [`WaitForGraph`] holds the edges and finds cycles; [`pick_victim`] chooses
 //! which member of a cycle to abort. The graph is pure data — no locks, no
 //! threads — which keeps the detection logic small enough to test exhaustively.
-//! [`LockManager`](crate::LockManager) builds one of these from its live wait
-//! set, recomputed from the current lock table, so detection never acts on a
-//! stale edge and so never aborts a transaction that is not actually deadlocked.
+//! [`LockManager`](crate::LockManager) runs the same search over its live wait
+//! set, reading each edge from the current lock table as the walk reaches it,
+//! so detection never acts on an edge left over from a released lock.
 //!
 //! [`pick_victim`]: WaitForGraph::pick_victim
 
@@ -23,8 +23,11 @@ use crate::TxnId;
 /// How to choose which transaction in a deadlock cycle to abort.
 ///
 /// Both policies break the cycle correctly; they differ only in which member
-/// pays. Transaction ids are taken as a proxy for age — a larger id is a
-/// transaction that started later.
+/// pays. Transaction ids are taken as a proxy for age: a larger id is a
+/// transaction that started later. A layer that restarts an aborted
+/// transaction under a new, larger id makes it the youngest again, so under
+/// [`Youngest`](Self::Youngest) the same work can be chosen repeatedly; give the
+/// restart an id that preserves its original age if that matters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum VictimPolicy {
@@ -174,10 +177,18 @@ impl WaitForGraph {
     /// g.add_wait(TxnId::new(3), TxnId::new(1));
     /// assert_eq!(g.detect_cycle().map(|c| c.len()), Some(3));
     /// ```
+    ///
+    /// The search shares one visited set across every starting node, so each
+    /// node and edge is examined at most once: the cost is linear in the size
+    /// of the graph.
     #[must_use]
     pub fn detect_cycle(&self) -> Option<Vec<TxnId>> {
+        let mut state: HashMap<TxnId, u8> = HashMap::new();
         for &start in self.edges.keys() {
-            if let Some(cycle) = self.cycle_from(start) {
+            if state.contains_key(&start) {
+                continue;
+            }
+            if let Some(cycle) = self.search(start, &mut state) {
                 return Some(cycle);
             }
         }
@@ -203,11 +214,15 @@ impl WaitForGraph {
     /// ```
     #[must_use]
     pub fn cycle_from(&self, start: TxnId) -> Option<Vec<TxnId>> {
-        // Iterative depth-first search. `state`: 0 unvisited, 1 on the current
-        // path, 2 fully explored. A back edge to a node still on the path is a
-        // cycle. Iterative rather than recursive so a long wait chain cannot
-        // overflow the stack.
-        let mut state: HashMap<TxnId, u8> = HashMap::new();
+        self.search(start, &mut HashMap::new())
+    }
+
+    /// Iterative depth-first search from `start`. `state`: absent unvisited, 1
+    /// on the current path, 2 fully explored; it is shared across calls by
+    /// [`detect_cycle`](Self::detect_cycle) so explored nodes are never
+    /// revisited. A back edge to a node still on the path is a cycle. Iterative
+    /// rather than recursive so a long wait chain cannot overflow the stack.
+    fn search(&self, start: TxnId, state: &mut HashMap<TxnId, u8>) -> Option<Vec<TxnId>> {
         let mut path: Vec<TxnId> = Vec::new();
         let mut stack: Vec<(TxnId, usize)> = Vec::new();
 

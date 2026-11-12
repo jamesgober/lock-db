@@ -12,17 +12,33 @@
 //! page and row numbers) evenly across shards without paying for a
 //! general-purpose hasher on the hot path.
 //!
-//! Each shard also keeps a reverse index from transaction to the resources it
-//! holds in that shard, so releasing every lock a transaction owns is
-//! proportional to the number of locks held, not to the size of the table.
+//! Each shard keeps a reverse index from transaction to the resources it holds
+//! in that shard. A second, smaller table sharded by transaction id records,
+//! per transaction, the shards it holds locks in and the one resource it is
+//! waiting for, so releasing every lock a transaction owns visits only the
+//! shards it used.
 //!
-//! This release ([crate-level docs](crate)) provides non-blocking acquisition:
-//! a request that cannot be granted immediately returns [`LockError::Conflict`]
-//! rather than waiting. Blocking acquisition with wait queues, and the
-//! deadlock detection that requires it, arrive in a later milestone.
+//! [`try_acquire`](LockManager::try_acquire) is non-blocking: a request that
+//! cannot be granted returns [`LockError::Conflict`] and is not tracked.
+//! [`request`](LockManager::request) is the deadlock-aware path: a request that
+//! cannot be granted joins a first-in, first-out wait queue on the resource and
+//! is checked for a deadlock by walking the wait-for edges reachable from it.
+//! lock-db does not park threads; the caller suspends and retries.
+//!
+//! # Lock ordering
+//!
+//! There are three kinds of mutex, always taken in this order: a resource
+//! shard, then a transaction shard, then the victim registry. Any of them may be
+//! skipped, but none is ever taken while holding one that comes later, and no
+//! code holds two resource shards or two transaction shards at once. That order
+//! rules out a deadlock inside the manager itself.
 
 #[cfg(loom)]
+use loom::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(loom)]
 use loom::sync::{Mutex, MutexGuard};
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicUsize, Ordering};
 #[cfg(not(loom))]
 use std::sync::{Mutex, MutexGuard};
 
@@ -60,6 +76,19 @@ impl LockEntry {
             holders: Vec::new(),
         }
     }
+
+    /// The mode `txn` holds this resource in, if any.
+    #[inline]
+    fn mode_of(&self, txn: TxnId) -> Option<LockMode> {
+        self.holders.iter().find(|h| h.txn == txn).map(|h| h.mode)
+    }
+}
+
+/// A transaction waiting in a resource's queue, and the mode it asked for.
+#[derive(Clone, Copy)]
+struct Waiter {
+    txn: TxnId,
+    mode: LockMode,
 }
 
 /// A transaction holding a key range in a space, and the mode it holds.
@@ -89,7 +118,7 @@ impl RangeSpace {
     }
 }
 
-/// The mutable state of one shard.
+/// The mutable state of one resource shard.
 struct ShardInner {
     /// Point locks: resources with at least one holder, keyed by resource id.
     locks: HashMap<ResourceId, LockEntry>,
@@ -100,6 +129,10 @@ struct ShardInner {
     /// Reverse index for range locks: the (space, range) pairs each transaction
     /// holds *in this shard*.
     range_by_txn: HashMap<TxnId, Vec<(ResourceId, KeyRange)>>,
+    /// Wait queues for [`LockManager::request`], per resource, in grant order:
+    /// waiting upgraders (transactions that already hold the resource) first,
+    /// then everyone else in arrival order.
+    queues: HashMap<ResourceId, Vec<Waiter>>,
 }
 
 impl ShardInner {
@@ -109,6 +142,25 @@ impl ShardInner {
             by_txn: HashMap::new(),
             ranges: HashMap::new(),
             range_by_txn: HashMap::new(),
+            queues: HashMap::new(),
+        }
+    }
+
+    /// Returns `true` if `txn` holds any point or range lock in this shard.
+    #[inline]
+    fn holds_any(&self, txn: TxnId) -> bool {
+        self.by_txn.contains_key(&txn) || self.range_by_txn.contains_key(&txn)
+    }
+
+    /// Removes `txn` from the wait queue on `res`, if it is queued there.
+    fn dequeue(&mut self, txn: TxnId, res: ResourceId) {
+        if let Some(queue) = self.queues.get_mut(&res) {
+            if let Some(pos) = queue.iter().position(|w| w.txn == txn) {
+                let _ = queue.remove(pos);
+            }
+            if queue.is_empty() {
+                let _ = self.queues.remove(&res);
+            }
         }
     }
 }
@@ -116,6 +168,172 @@ impl ShardInner {
 /// One independently locked partition of the table.
 struct Shard {
     inner: Mutex<ShardInner>,
+}
+
+/// How many shard indices a [`ShardSet`] holds inline before it spills to a
+/// bitset. Most transactions touch only a few shards.
+const INLINE_SHARDS: usize = 4;
+
+/// The set of resource shards a transaction holds locks in.
+///
+/// Up to [`INLINE_SHARDS`] indices are kept inline, so the common short
+/// transaction never allocates for this bookkeeping; past that the set becomes
+/// a bitset over the shard count.
+#[derive(Default)]
+struct ShardSet {
+    /// Inline indices, valid while `bits` is empty.
+    small: [usize; INLINE_SHARDS],
+    /// Number of valid entries in `small`.
+    len: usize,
+    /// Bitset of shard indices, used once more than `INLINE_SHARDS` distinct
+    /// shards have been recorded.
+    bits: Vec<u64>,
+}
+
+impl ShardSet {
+    #[inline]
+    fn insert(&mut self, idx: usize) {
+        if self.bits.is_empty() {
+            if self.small[..self.len].contains(&idx) {
+                return;
+            }
+            if self.len < INLINE_SHARDS {
+                self.small[self.len] = idx;
+                self.len += 1;
+                return;
+            }
+            let spilled = self.small;
+            self.len = 0;
+            for i in spilled {
+                self.set_bit(i);
+            }
+        }
+        self.set_bit(idx);
+    }
+
+    #[inline]
+    fn set_bit(&mut self, idx: usize) {
+        let word = idx / 64;
+        if self.bits.len() <= word {
+            self.bits.resize(word + 1, 0);
+        }
+        self.bits[word] |= 1 << (idx % 64);
+    }
+
+    #[inline]
+    fn remove(&mut self, idx: usize) {
+        if self.bits.is_empty() {
+            if let Some(p) = self.small[..self.len].iter().position(|&i| i == idx) {
+                self.small[p] = self.small[self.len - 1];
+                self.len -= 1;
+            }
+        } else if let Some(w) = self.bits.get_mut(idx / 64) {
+            *w &= !(1 << (idx % 64));
+        }
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.len == 0 && self.bits.iter().all(|w| *w == 0)
+    }
+
+    /// Calls `f` with every index in the set.
+    fn for_each(&self, mut f: impl FnMut(usize)) {
+        for &i in &self.small[..self.len] {
+            f(i);
+        }
+        for (w, word) in self.bits.iter().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                f(w * 64 + bits.trailing_zeros() as usize);
+                bits &= bits - 1;
+            }
+        }
+    }
+}
+
+/// Per-transaction bookkeeping, kept in a table sharded by transaction id.
+#[derive(Default)]
+struct TxnEntry {
+    /// The resource and mode this transaction is waiting for through
+    /// [`LockManager::request`], if any.
+    wait: Option<(ResourceId, LockMode)>,
+    /// The resource shards this transaction holds locks in.
+    shards: ShardSet,
+}
+
+impl TxnEntry {
+    #[inline]
+    fn set_shard(&mut self, idx: usize) {
+        self.shards.insert(idx);
+    }
+
+    #[inline]
+    fn clear_shard(&mut self, idx: usize) {
+        self.shards.remove(idx);
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.wait.is_none() && self.shards.is_empty()
+    }
+}
+
+/// One partition of the per-transaction table.
+type TxnMap = HashMap<TxnId, TxnEntry, BuildTxnHasher>;
+
+/// A fast hasher for the per-transaction table.
+///
+/// Transaction ids are assigned by the transaction layer, not taken from
+/// untrusted input, so the table does not need SipHash's flooding resistance.
+/// The id is multiplied by an odd constant and its halves folded, so that the
+/// low bits (bucket index) and the high bits (hashbrown's tag) both vary even
+/// within one shard, whose ids share the top bits of the Fibonacci hash.
+#[derive(Default, Clone, Copy)]
+struct BuildTxnHasher;
+
+impl core::hash::BuildHasher for BuildTxnHasher {
+    type Hasher = TxnHasher;
+    #[inline]
+    fn build_hasher(&self) -> TxnHasher {
+        TxnHasher(0)
+    }
+}
+
+/// The hasher built by [`BuildTxnHasher`]; only `write_u64` is ever used,
+/// since `TxnId` hashes as one `u64`.
+struct TxnHasher(u64);
+
+impl core::hash::Hasher for TxnHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        let h = self.0.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        h ^ (h >> 32)
+    }
+
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = self.0.rotate_left(5) ^ n;
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.rotate_left(5) ^ u64::from(b);
+        }
+    }
+}
+
+/// A transaction chosen as a deadlock victim and not yet released.
+struct VictimMark {
+    /// The cycle it was chosen from, reported again on each refused call.
+    cycle: Vec<TxnId>,
+    /// Whether the victim itself has been told (a refused call, a
+    /// [`Acquisition::Deadlock`] naming the requester, or
+    /// [`LockManager::is_aborted`]).
+    told: bool,
+    /// Whether it has been released once since it was marked.
+    released: bool,
 }
 
 /// A sharded lock table mapping resources to the transactions that hold them.
@@ -149,39 +367,50 @@ struct Shard {
 #[must_use = "a LockManager that is dropped immediately releases every lock it holds"]
 pub struct LockManager {
     shards: Box<[Shard]>,
+    /// Per-transaction bookkeeping (pending wait, shards used), sharded by
+    /// transaction id with the same count as `shards`.
+    txns: Box<[Mutex<TxnMap>]>,
     /// `log2(shards.len())`; `0` when there is a single shard.
     bits: u32,
-    /// The deadlock-aware wait set: each waiting transaction and the single
-    /// (resource, mode) request it is blocked on. A global mutex, taken only by
-    /// the deadlock-aware [`request`](LockManager::request) path — the
-    /// non-blocking `try_acquire`/`release` fast path never touches it.
-    ///
-    /// Lock ordering: this mutex is always the *outer* lock. `request` takes it
-    /// and then a shard mutex; nothing ever takes a shard mutex and then this
-    /// one. `release_all` clears its own entry in a separate critical section,
-    /// never nested with a shard lock, so no cycle is possible.
-    waits: Mutex<HashMap<TxnId, (ResourceId, LockMode)>>,
+    /// Deadlock victims that have not been released since being told.
+    victims: Mutex<HashMap<TxnId, VictimMark>>,
+    /// `victims.len()`, readable without the mutex so that the acquire paths
+    /// skip the registry entirely while no victim is outstanding.
+    victim_count: AtomicUsize,
 }
 
 /// The outcome of a deadlock-aware [`request`](LockManager::request).
 ///
 /// Unlike [`try_acquire`](LockManager::try_acquire), `request` does not just
-/// fail on conflict — it records the wait and tells the caller whether to
+/// fail on conflict: it records the wait and tells the caller whether to
 /// proceed, suspend, or abort.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[must_use = "the outcome decides whether the transaction proceeds, waits, or aborts"]
 pub enum Acquisition {
     /// The lock was granted; the transaction holds it and may proceed.
     Granted,
-    /// The lock is held incompatibly. The transaction is now registered as
-    /// waiting; the caller should suspend it and retry `request` later (for
-    /// example after a release). No deadlock was found.
+    /// The lock is held incompatibly, or an earlier waiter in the resource's
+    /// queue wants a conflicting mode. The transaction is now queued and
+    /// registered as waiting; the caller should suspend it and retry `request`
+    /// later (for example after a release), or give up with
+    /// [`cancel_wait`](LockManager::cancel_wait). No deadlock was found.
     Waiting,
     /// Granting the wait would close a cycle in the wait-for graph. The caller
     /// must abort the named victim (with [`release_all`](LockManager::release_all))
     /// to break the deadlock. The victim may be the requesting transaction
     /// itself or another transaction in the cycle.
+    ///
+    /// The same outcome, with `victim` equal to the requester, is returned to a
+    /// transaction that was already chosen as a victim and has not yet been
+    /// released: it must roll back and call `release_all` on itself.
     Deadlock(Deadlock),
+}
+
+/// What [`LockManager::request`] decided while holding the resource shard.
+enum Decision {
+    Granted,
+    Waiting,
+    Victim(Vec<TxnId>),
 }
 
 impl LockManager {
@@ -214,7 +443,7 @@ impl LockManager {
     ///
     /// `shards` is rounded up to the next power of two (and a request of `0` is
     /// treated as `1`), which lets the shard lookup use a shift instead of a
-    /// remainder. More shards reduce contention but cost a mutex and two small
+    /// remainder. More shards reduce contention but cost a mutex and a few small
     /// maps each; fewer shards save memory at the cost of more collisions.
     ///
     /// # Examples
@@ -230,15 +459,19 @@ impl LockManager {
         let n = shards.max(1).next_power_of_two();
         let bits = n.trailing_zeros();
         let mut v = Vec::with_capacity(n);
+        let mut t = Vec::with_capacity(n);
         for _ in 0..n {
             v.push(Shard {
                 inner: Mutex::new(ShardInner::new()),
             });
+            t.push(Mutex::new(HashMap::default()));
         }
         Self {
             shards: v.into_boxed_slice(),
+            txns: t.into_boxed_slice(),
             bits,
-            waits: Mutex::new(HashMap::new()),
+            victims: Mutex::new(HashMap::new()),
+            victim_count: AtomicUsize::new(0),
         }
     }
 
@@ -260,7 +493,7 @@ impl LockManager {
     ///   you hold is a no-op);
     /// - `txn` already holds `res` in some mode and the
     ///   [join](LockMode::join) of that mode with `mode` is compatible with
-    ///   every other holder (an in-place upgrade — for example shared to
+    ///   every other holder (an in-place upgrade, for example shared to
     ///   exclusive when sole holder, or shared plus intention-exclusive to SIX);
     ///   or
     /// - `txn` holds nothing on `res` and `mode` is compatible with every
@@ -270,9 +503,15 @@ impl LockManager {
     /// caller decides whether to retry, wait, or abort; this method never blocks
     /// the calling thread.
     ///
+    /// `try_acquire` checks the current holders only. It does not wait its turn
+    /// behind transactions queued through [`request`](Self::request); use
+    /// `request` everywhere when first-in, first-out fairness matters.
+    ///
     /// # Errors
     ///
-    /// Returns [`LockError::Conflict`] if the lock cannot be granted right now.
+    /// Returns [`LockError::Conflict`] if the lock cannot be granted right now,
+    /// and [`LockError::Aborted`] if `txn` was chosen as a deadlock victim and
+    /// has not been released since.
     ///
     /// # Examples
     ///
@@ -298,9 +537,17 @@ impl LockManager {
         res: ResourceId,
         mode: LockMode,
     ) -> Result<(), LockError> {
-        let mut guard = self.lock_shard(res);
+        let idx = self.shard_index(res);
+        let mut guard = Self::lock(&self.shards[idx]);
+        if self.victim_cycle(txn).is_some() {
+            return Err(LockError::Aborted);
+        }
+        let first = !guard.holds_any(txn);
         let ShardInner { locks, by_txn, .. } = &mut *guard;
         if Self::try_grant_locked(locks, by_txn, txn, res, mode) {
+            if first {
+                self.note_shard(txn, idx);
+            }
             Ok(())
         } else {
             Err(LockError::Conflict)
@@ -373,7 +620,8 @@ impl LockManager {
     /// assert_eq!(lm.release(t, key), Err(LockError::NotHeld));
     /// ```
     pub fn release(&self, txn: TxnId, res: ResourceId) -> Result<(), LockError> {
-        let mut guard = self.lock_shard(res);
+        let idx = self.shard_index(res);
+        let mut guard = Self::lock(&self.shards[idx]);
         let ShardInner { locks, by_txn, .. } = &mut *guard;
 
         let entry = match locks.get_mut(&res) {
@@ -390,16 +638,31 @@ impl LockManager {
             let _ = locks.remove(&res);
         }
         Self::forget_resource(by_txn, txn, res);
+        if !guard.holds_any(txn) {
+            self.forget_shard(txn, idx);
+        }
         Ok(())
     }
 
-    /// Releases every lock held by `txn` across the whole table — both point
-    /// locks and range locks.
+    /// Releases every lock held by `txn` across the whole table (both point
+    /// locks and range locks) and clears any wait it has registered.
     ///
     /// This is the call a transaction layer makes at commit or abort to drop a
     /// transaction's entire lock set at once. It returns the number of locks
-    /// released, and is proportional to that number rather than to the size of
-    /// the table.
+    /// released. Its cost is proportional to the number of shards the
+    /// transaction holds locks in, not to the size of the table or the shard
+    /// count. Releasing a deadlock victim from another thread visits every
+    /// shard, so that a lock the victim's own thread took concurrently cannot
+    /// be missed.
+    ///
+    /// For a transaction chosen as a deadlock victim, `release_all` frees its
+    /// locks but keeps it marked as a victim until the victim itself has been
+    /// told (see [`is_aborted`](Self::is_aborted)), so that a release by the
+    /// thread that found the deadlock does not let the victim carry on. The
+    /// mark is cleared by the first `release_all` after the victim was told, or
+    /// by the second `release_all` since it was marked (the victim's own
+    /// release after another thread released it), and the id can then be used
+    /// again.
     ///
     /// # Examples
     ///
@@ -417,51 +680,75 @@ impl LockManager {
     /// assert_eq!(lm.release_all(t), 0); // idempotent once empty
     /// ```
     pub fn release_all(&self, txn: TxnId) -> usize {
-        // Clear any pending wait first, in its own critical section. This never
-        // nests with a shard lock, so it cannot deadlock against `request`
-        // (which takes `waits` then a shard); see the `waits` field docs.
-        {
-            let mut waits = self.lock_waits();
-            let _ = waits.remove(&txn);
+        let entry = {
+            let mut txns = self.lock_txns(txn);
+            txns.remove(&txn).unwrap_or_default()
+        };
+        // Read the mark only after the wait is gone: a victim is marked only
+        // while it has a wait (under its transaction shard), so a mark set
+        // concurrently is either visible here or never set at all.
+        let victim = self.victim_state(txn);
+        if let Some((res, _)) = entry.wait {
+            Self::lock(&self.shards[self.shard_index(res)]).dequeue(txn, res);
         }
 
         let mut released = 0;
-        for shard in self.shards.iter() {
-            let mut guard = Self::lock(shard);
-            let ShardInner {
-                locks,
-                by_txn,
-                ranges,
-                range_by_txn,
-            } = &mut *guard;
+        if victim.is_some() {
+            for shard in self.shards.iter() {
+                released += Self::sweep(&mut Self::lock(shard), txn);
+            }
+        } else {
+            entry.shards.for_each(|idx| {
+                if let Some(shard) = self.shards.get(idx) {
+                    released += Self::sweep(&mut Self::lock(shard), txn);
+                }
+            });
+        }
 
-            if let Some(resources) = by_txn.remove(&txn) {
-                for res in resources {
-                    if let Some(entry) = locks.get_mut(&res) {
-                        if let Some(pos) = entry.holders.iter().position(|h| h.txn == txn) {
-                            let _ = entry.holders.swap_remove(pos);
-                            released += 1;
-                            if entry.holders.is_empty() {
-                                let _ = locks.remove(&res);
-                            }
+        if victim.is_some() {
+            self.settle_victim(txn);
+        }
+        released
+    }
+
+    /// Drops every point and range lock `txn` holds in one shard, returning how
+    /// many were dropped.
+    fn sweep(inner: &mut ShardInner, txn: TxnId) -> usize {
+        let ShardInner {
+            locks,
+            by_txn,
+            ranges,
+            range_by_txn,
+            ..
+        } = inner;
+        let mut released = 0;
+
+        if let Some(resources) = by_txn.remove(&txn) {
+            for res in resources {
+                if let Some(entry) = locks.get_mut(&res) {
+                    if let Some(pos) = entry.holders.iter().position(|h| h.txn == txn) {
+                        let _ = entry.holders.swap_remove(pos);
+                        released += 1;
+                        if entry.holders.is_empty() {
+                            let _ = locks.remove(&res);
                         }
                     }
                 }
             }
+        }
 
-            if let Some(spaces) = range_by_txn.remove(&txn) {
-                for (space, range) in spaces {
-                    if let Some(rs) = ranges.get_mut(&space) {
-                        if let Some(pos) = rs
-                            .holders
-                            .iter()
-                            .position(|h| h.txn == txn && h.range == range)
-                        {
-                            let _ = rs.holders.swap_remove(pos);
-                            released += 1;
-                            if rs.holders.is_empty() {
-                                let _ = ranges.remove(&space);
-                            }
+        if let Some(spaces) = range_by_txn.remove(&txn) {
+            for (space, range) in spaces {
+                if let Some(rs) = ranges.get_mut(&space) {
+                    if let Some(pos) = rs
+                        .holders
+                        .iter()
+                        .position(|h| h.txn == txn && h.range == range)
+                    {
+                        let _ = rs.holders.swap_remove(pos);
+                        released += 1;
+                        if rs.holders.is_empty() {
+                            let _ = ranges.remove(&space);
                         }
                     }
                 }
@@ -470,36 +757,66 @@ impl LockManager {
         released
     }
 
-    /// Acquires `mode` on `res` for `txn`, registering a wait and detecting
+    /// Acquires `mode` on `res` for `txn`, queueing a wait and detecting
     /// deadlock if it cannot be granted.
     ///
     /// This is the deadlock-aware counterpart to
     /// [`try_acquire`](Self::try_acquire). The three outcomes are:
     ///
-    /// - [`Acquisition::Granted`] — the lock was granted; proceed.
-    /// - [`Acquisition::Waiting`] — the lock is held incompatibly and `txn` is
-    ///   now recorded in the wait-for graph. The caller should suspend the
-    ///   transaction and call `request` again later (for example after a
-    ///   release) to retry. No deadlock was found.
-    /// - [`Acquisition::Deadlock`] — granting the wait would close a cycle. The
+    /// - [`Acquisition::Granted`]: the lock was granted; proceed.
+    /// - [`Acquisition::Waiting`]: `txn` is now queued on `res` and recorded
+    ///   as waiting. The caller should suspend the transaction and call
+    ///   `request` again later (for example after a release) to retry. No
+    ///   deadlock was found.
+    /// - [`Acquisition::Deadlock`]: granting the wait would close a cycle. The
     ///   caller must abort the [`Deadlock::victim`] with
     ///   [`release_all`](Self::release_all). The victim may be `txn` or another
-    ///   transaction in the cycle.
+    ///   transaction in the cycle. It is also returned, naming `txn` itself, when
+    ///   `txn` was already chosen as a victim and has not been released.
     ///
-    /// Detection is exact: the wait-for graph is rebuilt from the current lock
-    /// table on every call, so a wait left over from a lock that has since been
-    /// released contributes no edge, and a transaction is never reported as
-    /// deadlocked unless it genuinely is. The victim is chosen by the
-    /// [`VictimPolicy::Youngest`] policy; callers wanting a different policy can
-    /// apply [`WaitForGraph::pick_victim`] to [`Deadlock::cycle`] themselves.
+    /// # Fairness
+    ///
+    /// Each resource has a first-in, first-out wait queue. A request is granted
+    /// only when it is compatible with every current holder and with every
+    /// transaction queued ahead of it, so a waiting writer is not overtaken by
+    /// a stream of newer readers. A transaction that already holds the resource
+    /// and asks for a stronger mode (an upgrade) queues ahead of transactions
+    /// that hold nothing on it, which is the standard rule. A transaction can
+    /// wait on one resource at a time; a `request` for a different resource
+    /// moves its wait there.
+    ///
+    /// A queued transaction holds its place until it is granted, calls
+    /// [`cancel_wait`](Self::cancel_wait), or is released with
+    /// [`release_all`](Self::release_all). A waiter that gives up without
+    /// either call keeps blocking the transactions queued behind it, and leaves
+    /// a stale wait-for edge.
+    ///
+    /// # Detection
+    ///
+    /// Detection runs at the moment of the wait, from the new waiter only. It
+    /// walks the wait-for edges reachable from `txn`, reading each waiter's
+    /// edges from the current lock table (holders in a conflicting mode, and
+    /// conflicting waiters queued ahead of it), so its cost depends on the part
+    /// of the graph the new wait can reach, not on the number of waiters in the
+    /// system. A wait left over from a lock that has since been released
+    /// contributes no edge. Detection is exact provided every abandoned wait is
+    /// cleared with `cancel_wait` or `release_all`: a stale wait still counts as
+    /// waiting and can close a cycle that no live transaction is in.
+    ///
+    /// The victim is chosen by the [`VictimPolicy::Youngest`] policy; callers
+    /// wanting a different policy can apply [`WaitForGraph::pick_victim`] to
+    /// [`Deadlock::cycle`] themselves. The victim is marked: its next
+    /// `request`, [`try_acquire`](Self::try_acquire), or
+    /// [`try_acquire_range`](Self::try_acquire_range) is refused until it is
+    /// released after being told (see [`is_aborted`](Self::is_aborted)). A
+    /// victim is marked only while it still has a registered wait; if the walk
+    /// read an edge that has since gone and the victim has stopped waiting,
+    /// there is no cycle left and `Waiting` is returned instead.
     ///
     /// Only transactions that wait through `request` appear in the graph; a
     /// transaction that spins on `try_acquire` is invisible to deadlock
     /// detection. Range locks ([`try_acquire_range`](Self::try_acquire_range))
     /// are likewise not tracked here.
-    ///
-    /// `request` serializes on a single wait-registry mutex, unlike the sharded
-    /// `try_acquire`; it is the path to use when you need deadlock detection.
     ///
     /// # Examples
     ///
@@ -527,38 +844,242 @@ impl LockManager {
     /// }
     /// ```
     pub fn request(&self, txn: TxnId, res: ResourceId, mode: LockMode) -> Acquisition {
-        // `waits` is the outer lock; the grant attempt and graph build both take
-        // shard locks underneath it, never the reverse.
-        let mut waits = self.lock_waits();
+        let idx = self.shard_index(res);
+        let (decision, previous) = {
+            let mut guard = Self::lock(&self.shards[idx]);
+            if let Some(cycle) = self.victim_cycle(txn) {
+                (Decision::Victim(cycle), None)
+            } else {
+                let first = !guard.holds_any(txn);
+                let ShardInner {
+                    locks,
+                    by_txn,
+                    queues,
+                    ..
+                } = &mut *guard;
+                let entry = locks.get(&res);
+                let held = entry.and_then(|e| e.mode_of(txn));
+                let covered = held.is_some_and(|h| h.covers(mode));
+                let target = held.map_or(mode, |h| h.join(mode));
+                let queue = queues.get(&res);
+                let pos = queue.and_then(|q| q.iter().position(|w| w.txn == txn));
 
-        let granted = {
-            let mut guard = self.lock_shard(res);
-            let ShardInner { locks, by_txn, .. } = &mut *guard;
-            Self::try_grant_locked(locks, by_txn, txn, res, mode)
+                let blocked_by_queue = !covered
+                    && queue.is_some_and(|q| {
+                        let ahead = match pos {
+                            Some(p) => &q[..p],
+                            None if held.is_some() => &q[..Self::upgraders(q, entry)],
+                            None => &q[..],
+                        };
+                        ahead.iter().any(|w| {
+                            w.txn != txn && !Self::queued_target(entry, w).compatible_with(target)
+                        })
+                    });
+
+                if !blocked_by_queue && Self::try_grant_locked(locks, by_txn, txn, res, mode) {
+                    if pos.is_some() {
+                        guard.dequeue(txn, res);
+                    }
+                    let previous = self.set_wait(txn, None, first.then_some(idx));
+                    (Decision::Granted, previous)
+                } else {
+                    let queue = queues.entry(res).or_default();
+                    match pos {
+                        Some(p) => queue[p].mode = mode,
+                        None => {
+                            let at = if held.is_some() {
+                                Self::upgraders(queue, locks.get(&res))
+                            } else {
+                                queue.len()
+                            };
+                            queue.insert(at, Waiter { txn, mode });
+                        }
+                    }
+                    let previous = self.set_wait(txn, Some((res, mode)), None);
+                    (Decision::Waiting, previous)
+                }
+            }
         };
-        if granted {
-            let _ = waits.remove(&txn);
-            return Acquisition::Granted;
+
+        // A transaction waits on one resource at a time: leave the old queue.
+        if let Some((old, _)) = previous {
+            if old != res {
+                Self::lock(&self.shards[self.shard_index(old)]).dequeue(txn, old);
+            }
         }
 
-        let _ = waits.insert(txn, (res, mode));
-        let graph = self.build_wait_graph(&waits);
-        match graph.cycle_from(txn) {
-            Some(cycle) => {
-                let victim =
-                    WaitForGraph::pick_victim(&cycle, DEADLOCK_VICTIM_POLICY).unwrap_or(txn);
-                Acquisition::Deadlock(Deadlock { victim, cycle })
+        match decision {
+            Decision::Granted => Acquisition::Granted,
+            Decision::Victim(cycle) => Acquisition::Deadlock(Deadlock { victim: txn, cycle }),
+            Decision::Waiting => {
+                let found = self.walk(core::iter::once(txn)).and_then(|cycle| {
+                    let victim =
+                        WaitForGraph::pick_victim(&cycle, DEADLOCK_VICTIM_POLICY).unwrap_or(txn);
+                    self.mark_victim(victim, &cycle, victim == txn)
+                        .then_some(Deadlock { victim, cycle })
+                });
+                match found {
+                    Some(d) => Acquisition::Deadlock(d),
+                    None => Acquisition::Waiting,
+                }
             }
-            None => Acquisition::Waiting,
         }
     }
 
-    /// Removes any pending wait for `txn` from the wait-for graph.
+    /// The number of leading queue entries that already hold the resource
+    /// (waiting upgraders), which is where a new upgrader is inserted.
+    fn upgraders(queue: &[Waiter], entry: Option<&LockEntry>) -> usize {
+        queue
+            .iter()
+            .take_while(|w| entry.is_some_and(|e| e.mode_of(w.txn).is_some()))
+            .count()
+    }
+
+    /// The mode a queued waiter would end up holding if granted: the join with
+    /// what it already holds for an upgrader, the requested mode otherwise.
+    #[inline]
+    fn queued_target(entry: Option<&LockEntry>, w: &Waiter) -> LockMode {
+        entry
+            .and_then(|e| e.mode_of(w.txn))
+            .map_or(w.mode, |h| h.join(w.mode))
+    }
+
+    /// Records (or clears) `txn`'s pending wait and, when `first_shard` is
+    /// given, that `txn` now holds a lock in that shard. Returns the previous
+    /// wait. Called under a resource shard lock (resource before transaction).
+    fn set_wait(
+        &self,
+        txn: TxnId,
+        wait: Option<(ResourceId, LockMode)>,
+        first_shard: Option<usize>,
+    ) -> Option<(ResourceId, LockMode)> {
+        let mut txns = self.lock_txns(txn);
+        if wait.is_none() && first_shard.is_none() {
+            // Clearing only: avoid creating an entry for a transaction that has
+            // none.
+            let entry = txns.get_mut(&txn)?;
+            let previous = entry.wait.take();
+            if entry.is_empty() {
+                let _ = txns.remove(&txn);
+            }
+            return previous;
+        }
+        let entry = txns.entry(txn).or_default();
+        let previous = core::mem::replace(&mut entry.wait, wait);
+        if let Some(idx) = first_shard {
+            entry.set_shard(idx);
+        }
+        if entry.is_empty() {
+            let _ = txns.remove(&txn);
+        }
+        previous
+    }
+
+    /// Records that `txn` holds a lock in shard `idx`.
+    fn note_shard(&self, txn: TxnId, idx: usize) {
+        self.lock_txns(txn).entry(txn).or_default().set_shard(idx);
+    }
+
+    /// Records that `txn` no longer holds any lock in shard `idx`.
+    fn forget_shard(&self, txn: TxnId, idx: usize) {
+        let mut txns = self.lock_txns(txn);
+        if let Some(entry) = txns.get_mut(&txn) {
+            entry.clear_shard(idx);
+            if entry.is_empty() {
+                let _ = txns.remove(&txn);
+            }
+        }
+    }
+
+    /// The wait-for edges out of `txn`, read from the current lock table: the
+    /// holders of the resource it waits for whose mode conflicts with what it
+    /// would hold, and the conflicting waiters queued ahead of it.
+    fn wait_edges(&self, txn: TxnId) -> Vec<TxnId> {
+        let wait = self.lock_txns(txn).get(&txn).and_then(|e| e.wait);
+        let Some((res, mode)) = wait else {
+            return Vec::new();
+        };
+        let guard = self.lock_shard(res);
+        let entry = guard.locks.get(&res);
+        let target = entry
+            .and_then(|e| e.mode_of(txn))
+            .map_or(mode, |h| h.join(mode));
+        let mut out = Vec::new();
+        if let Some(e) = entry {
+            out.extend(
+                e.holders
+                    .iter()
+                    .filter(|h| h.txn != txn && !h.mode.compatible_with(target))
+                    .map(|h| h.txn),
+            );
+        }
+        if let Some(q) = guard.queues.get(&res) {
+            if let Some(p) = q.iter().position(|w| w.txn == txn) {
+                out.extend(
+                    q[..p]
+                        .iter()
+                        .filter(|w| !Self::queued_target(entry, w).compatible_with(target))
+                        .map(|w| w.txn),
+                );
+            }
+        }
+        out
+    }
+
+    /// Depth-first search for a cycle in the wait-for graph, from each start in
+    /// turn, with one visited set shared by every start so that each node and
+    /// edge is examined at most once. Edges are read from the lock table as
+    /// nodes are reached; no lock is held across the walk.
+    fn walk(&self, starts: impl IntoIterator<Item = TxnId>) -> Option<Vec<TxnId>> {
+        // 1: on the current path, 2: fully explored.
+        let mut colour: HashMap<TxnId, u8> = HashMap::new();
+        let mut path: Vec<TxnId> = Vec::new();
+        let mut stack: Vec<(Vec<TxnId>, usize)> = Vec::new();
+
+        for start in starts {
+            if colour.contains_key(&start) {
+                continue;
+            }
+            let _ = colour.insert(start, 1);
+            path.push(start);
+            stack.push((self.wait_edges(start), 0));
+
+            while let Some((edges, idx)) = stack.last_mut() {
+                if let Some(&next) = edges.get(*idx) {
+                    *idx += 1;
+                    match colour.get(&next).copied() {
+                        Some(1) => {
+                            let pos = path.iter().position(|t| *t == next).unwrap_or(0);
+                            return Some(path[pos..].to_vec());
+                        }
+                        Some(_) => {}
+                        None => {
+                            let _ = colour.insert(next, 1);
+                            path.push(next);
+                            let edges = self.wait_edges(next);
+                            stack.push((edges, 0));
+                        }
+                    }
+                } else {
+                    if let Some(done) = path.pop() {
+                        let _ = colour.insert(done, 2);
+                    }
+                    let _ = stack.pop();
+                }
+            }
+        }
+        None
+    }
+
+    /// Removes any pending wait for `txn` and takes it out of the resource's
+    /// wait queue.
     ///
     /// Call this when a transaction that previously got [`Acquisition::Waiting`]
     /// stops waiting without acquiring the lock (for example it timed out or was
     /// aborted for another reason). [`release_all`](Self::release_all) already
-    /// clears the wait, so this is only needed when releasing nothing.
+    /// clears the wait, so this is only needed when releasing nothing. Skipping
+    /// it leaves the transaction queued, blocking later requests on the
+    /// resource, and leaves a stale wait-for edge.
     ///
     /// # Examples
     ///
@@ -574,17 +1095,23 @@ impl LockManager {
     /// assert_eq!(lm.waiting_count(), 0);
     /// ```
     pub fn cancel_wait(&self, txn: TxnId) {
-        let mut waits = self.lock_waits();
-        let _ = waits.remove(&txn);
+        let previous = self.set_wait(txn, None, None);
+        if let Some((res, _)) = previous {
+            Self::lock(&self.shards[self.shard_index(res)]).dequeue(txn, res);
+        }
     }
 
     /// Scans the current wait set for a deadlock, returning one if found.
     ///
     /// This is the periodic-detection counterpart to the at-wait detection in
     /// [`request`](Self::request): a background task can call it on an interval
-    /// instead of (or in addition to) acting on `request`'s result. It rebuilds
-    /// the wait-for graph from the current lock table, so it reports only
-    /// genuine deadlocks. Returns `None` when no cycle exists.
+    /// instead of (or in addition to) acting on `request`'s result. It reads
+    /// the wait-for edges from the current lock table and visits each waiter
+    /// and edge once, so its cost is linear in the size of the wait-for graph.
+    /// No lock is held across the walk. Returns `None` when no cycle exists.
+    ///
+    /// The victim it names is marked, exactly as for `request`: abort it with
+    /// [`release_all`](Self::release_all).
     ///
     /// # Examples
     ///
@@ -602,11 +1129,19 @@ impl LockManager {
     /// ```
     #[must_use]
     pub fn find_deadlock(&self) -> Option<Deadlock> {
-        let waits = self.lock_waits();
-        let graph = self.build_wait_graph(&waits);
-        let cycle = graph.detect_cycle()?;
+        let mut waiters = Vec::new();
+        for shard in self.txns.iter() {
+            let txns = Self::lock_map(shard);
+            waiters.extend(
+                txns.iter()
+                    .filter(|(_, e)| e.wait.is_some())
+                    .map(|(t, _)| *t),
+            );
+        }
+        let cycle = self.walk(waiters)?;
         let victim = WaitForGraph::pick_victim(&cycle, DEADLOCK_VICTIM_POLICY)?;
-        Some(Deadlock { victim, cycle })
+        self.mark_victim(victim, &cycle, false)
+            .then_some(Deadlock { victim, cycle })
     }
 
     /// Returns the number of transactions currently registered as waiting.
@@ -614,41 +1149,147 @@ impl LockManager {
     /// Mostly useful for diagnostics and tests.
     #[must_use]
     pub fn waiting_count(&self) -> usize {
-        self.lock_waits().len()
+        self.txns
+            .iter()
+            .map(|shard| {
+                Self::lock_map(shard)
+                    .values()
+                    .filter(|e| e.wait.is_some())
+                    .count()
+            })
+            .sum()
     }
 
-    /// Builds a wait-for graph from the live wait set, reading the *current*
-    /// holders of each waited resource from the lock table. Rebuilding from
-    /// truth on every detection is what keeps detection from acting on a stale
-    /// edge. Called while holding the `waits` lock; takes shard locks underneath.
-    fn build_wait_graph(&self, waits: &HashMap<TxnId, (ResourceId, LockMode)>) -> WaitForGraph {
-        let mut graph = WaitForGraph::new();
-        for (&waiter, &(res, mode)) in waits {
-            let blockers = self.holders_blocking(waiter, res, mode);
-            graph.add_waits(waiter, &blockers);
+    /// Returns `true` if `txn` was chosen as a deadlock victim and has not been
+    /// released since being told.
+    ///
+    /// When the victim is not the transaction whose `request` found the
+    /// deadlock, its own thread is not told by that call. It learns from its
+    /// next `request` (an [`Acquisition::Deadlock`] naming itself),
+    /// `try_acquire` or `try_acquire_range` ([`LockError::Aborted`]), or from
+    /// this method. A `true` answer counts as telling it: the victim then rolls
+    /// back and calls [`release_all`](Self::release_all) on itself, which
+    /// clears the mark. A victim that gives up and calls `release_all` without
+    /// being told also clears it, if another thread had already released it.
+    /// A caller that aborts some other transaction instead of the named victim
+    /// leaves the victim marked until the victim next calls into the manager
+    /// or is released twice.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lock_db::{Acquisition, LockError, LockManager, LockMode, ResourceId, TxnId};
+    ///
+    /// let lm = LockManager::new();
+    /// let (a, b) = (ResourceId::new(1), ResourceId::new(2));
+    /// let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+    /// lm.request(t2, a, LockMode::Exclusive);
+    /// lm.request(t1, b, LockMode::Exclusive);
+    /// lm.request(t2, b, LockMode::Exclusive); // T2 waits for T1
+    ///
+    /// // T1 closes the cycle; the victim is T2, not T1.
+    /// let Acquisition::Deadlock(d) = lm.request(t1, a, LockMode::Exclusive) else { panic!() };
+    /// assert_eq!(d.victim, t2);
+    /// lm.release_all(t2); // T1's thread aborts T2
+    ///
+    /// // T2's own thread is refused until it rolls back and releases itself.
+    /// assert_eq!(lm.try_acquire(t2, b, LockMode::Shared), Err(LockError::Aborted));
+    /// assert!(lm.is_aborted(t2));
+    /// lm.release_all(t2);
+    /// assert!(!lm.is_aborted(t2));
+    /// ```
+    #[must_use]
+    pub fn is_aborted(&self, txn: TxnId) -> bool {
+        self.victim_cycle(txn).is_some()
+    }
+
+    /// If `txn` is a marked victim, marks it told and returns its cycle.
+    fn victim_cycle(&self, txn: TxnId) -> Option<Vec<TxnId>> {
+        if self.victim_count.load(Ordering::SeqCst) == 0 {
+            return None;
         }
-        graph
+        let mut victims = self.lock_victims();
+        let mark = victims.get_mut(&txn)?;
+        mark.told = true;
+        Some(mark.cycle.clone())
     }
 
-    /// Returns the transactions, other than `waiter`, that currently hold `res`
-    /// in a mode incompatible with `mode` — the transactions `waiter` is blocked
-    /// by.
-    fn holders_blocking(&self, waiter: TxnId, res: ResourceId, mode: LockMode) -> Vec<TxnId> {
-        let guard = self.lock_shard(res);
-        guard.locks.get(&res).map_or_else(Vec::new, |entry| {
-            entry
-                .holders
-                .iter()
-                .filter(|h| h.txn != waiter && !h.mode.compatible_with(mode))
-                .map(|h| h.txn)
-                .collect()
-        })
+    /// `Some(told)` if `txn` is a marked victim, without changing the mark.
+    fn victim_state(&self, txn: TxnId) -> Option<bool> {
+        if self.victim_count.load(Ordering::SeqCst) == 0 {
+            return None;
+        }
+        self.lock_victims().get(&txn).map(|m| m.told)
     }
 
-    /// Locks the wait registry, recovering its guard if the mutex was poisoned.
+    /// Marks `victim` as chosen to abort from `cycle`, and returns `true`, if
+    /// it still has a registered wait. A victim that is no longer waiting has
+    /// left the cycle (the walk read an edge that has since gone), so there is
+    /// nothing to break and nothing is marked. The check and the mark happen
+    /// under the victim's transaction shard, which `release_all` also takes
+    /// before reading the mark.
+    fn mark_victim(&self, victim: TxnId, cycle: &[TxnId], told: bool) -> bool {
+        let txns = self.lock_txns(victim);
+        if txns.get(&victim).and_then(|e| e.wait).is_none() {
+            return false;
+        }
+        let mut victims = self.lock_victims();
+        match victims.get_mut(&victim) {
+            Some(mark) => mark.told |= told,
+            None => {
+                let _ = victims.insert(
+                    victim,
+                    VictimMark {
+                        cycle: cycle.to_vec(),
+                        told,
+                        released: false,
+                    },
+                );
+                let _ = self.victim_count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        true
+    }
+
+    /// Called after `txn`, a marked victim, was released: clears the mark if
+    /// the victim had been told or this is its second release, and otherwise
+    /// records the first release.
+    fn settle_victim(&self, txn: TxnId) {
+        let mut victims = self.lock_victims();
+        let clear = match victims.get_mut(&txn) {
+            Some(mark) if mark.told || mark.released => true,
+            Some(mark) => {
+                mark.released = true;
+                false
+            }
+            None => false,
+        };
+        if clear {
+            let _ = victims.remove(&txn);
+            let _ = self.victim_count.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Locks the victim registry, recovering its guard if the mutex was
+    /// poisoned.
     #[inline]
-    fn lock_waits(&self) -> MutexGuard<'_, HashMap<TxnId, (ResourceId, LockMode)>> {
-        match self.waits.lock() {
+    fn lock_victims(&self) -> MutexGuard<'_, HashMap<TxnId, VictimMark>> {
+        match self.victims.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Locks the transaction shard that owns `txn`.
+    #[inline]
+    fn lock_txns(&self, txn: TxnId) -> MutexGuard<'_, TxnMap> {
+        Self::lock_map(&self.txns[self.index_of(txn.get())])
+    }
+
+    /// Locks a transaction shard, recovering its guard if it was poisoned.
+    #[inline]
+    fn lock_map(shard: &Mutex<TxnMap>) -> MutexGuard<'_, TxnMap> {
+        match shard.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
@@ -694,17 +1335,13 @@ impl LockManager {
     #[must_use]
     pub fn mode_held(&self, txn: TxnId, res: ResourceId) -> Option<LockMode> {
         let guard = self.lock_shard(res);
-        guard
-            .locks
-            .get(&res)
-            .and_then(|e| e.holders.iter().find(|h| h.txn == txn))
-            .map(|h| h.mode)
+        guard.locks.get(&res).and_then(|e| e.mode_of(txn))
     }
 
     /// Tries to acquire `mode` over the key range `range` in key space `space`,
     /// for `txn`, without blocking.
     ///
-    /// A range lock protects a contiguous span of keys — use it to stop another
+    /// A range lock protects a contiguous span of keys: use it to stop another
     /// transaction from inserting into, or writing within, a range you have
     /// read (phantom and predicate protection). `space` identifies the key space
     /// the range lives in, typically an index; ranges in different spaces never
@@ -712,14 +1349,19 @@ impl LockManager {
     ///
     /// The request is granted unless some **other** transaction already holds an
     /// [overlapping](KeyRange::overlaps) range in `space` in an
-    /// [incompatible](LockMode::compatible_with) mode. The same transaction may
-    /// hold several ranges in a space, including overlapping ones; range locks
-    /// are not merged or upgraded.
+    /// [incompatible](LockMode::compatible_with) mode. Re-acquisition is
+    /// idempotent: when `txn` already holds a range in `space` that contains
+    /// `range` in a mode that [covers](LockMode::covers) `mode`, nothing
+    /// changes, and a request for exactly a range it already holds upgrades that
+    /// lock in place to the [join](LockMode::join) of the two modes. Other
+    /// ranges of the same transaction, including overlapping ones, are kept as
+    /// separate locks.
     ///
     /// # Errors
     ///
     /// Returns [`LockError::Conflict`] if an overlapping, incompatible range is
-    /// held by another transaction.
+    /// held by another transaction, and [`LockError::Aborted`] if `txn` was
+    /// chosen as a deadlock victim and has not been released since.
     ///
     /// # Examples
     ///
@@ -748,34 +1390,70 @@ impl LockManager {
         range: KeyRange,
         mode: LockMode,
     ) -> Result<(), LockError> {
-        let mut guard = self.lock_shard(space);
+        let idx = self.shard_index(space);
+        let mut guard = Self::lock(&self.shards[idx]);
+        if self.victim_cycle(txn).is_some() {
+            return Err(LockError::Aborted);
+        }
+        let first = !guard.holds_any(txn);
         let ShardInner {
             ranges,
             range_by_txn,
             ..
         } = &mut *guard;
+
+        // Idempotence: only a range this transaction already holds in `space`
+        // that contains the request can cover it or be upgraded in place. The
+        // transaction's own list is short, so check it before touching the
+        // space's holders.
+        let contains = |r: &KeyRange| r.start() <= range.start() && range.end() <= r.end();
+        let own_hit = range_by_txn
+            .get(&txn)
+            .is_some_and(|held| held.iter().any(|(s, r)| *s == space && contains(r)));
+
         let rs = ranges.entry(space).or_insert_with(RangeSpace::new);
+        let mut same = None;
+        if own_hit {
+            for (i, h) in rs.holders.iter().enumerate() {
+                if h.txn == txn && contains(&h.range) {
+                    if h.mode.covers(mode) {
+                        return Ok(());
+                    }
+                    if h.range == range {
+                        same = Some(i);
+                    }
+                }
+            }
+        }
+        let target = same.map_or(mode, |p| rs.holders[p].mode.join(mode));
 
         let conflict = rs
             .holders
             .iter()
-            .any(|h| h.txn != txn && h.range.overlaps(range) && !h.mode.compatible_with(mode));
+            .any(|h| h.txn != txn && h.range.overlaps(range) && !h.mode.compatible_with(target));
         if conflict {
             // A conflict implies a pre-existing holder, so the space entry is
             // non-empty and there is nothing to clean up.
             return Err(LockError::Conflict);
         }
 
+        if let Some(p) = same {
+            rs.holders[p].mode = target;
+            return Ok(());
+        }
         rs.holders.push(RangeHolder { txn, range, mode });
         range_by_txn.entry(txn).or_default().push((space, range));
+        if first {
+            self.note_shard(txn, idx);
+        }
         Ok(())
     }
 
     /// Releases a range lock `txn` holds over `range` in `space`.
     ///
-    /// Matches on the transaction and the exact range. If the transaction holds
-    /// several locks on the identical range (in different modes), one is
-    /// released per call.
+    /// Matches on the transaction and the exact range. A transaction holds at
+    /// most one lock on any exact range (re-acquiring it upgrades in place), so
+    /// one call releases it.
     ///
     /// # Errors
     ///
@@ -802,7 +1480,8 @@ impl LockManager {
         space: ResourceId,
         range: KeyRange,
     ) -> Result<(), LockError> {
-        let mut guard = self.lock_shard(space);
+        let idx = self.shard_index(space);
+        let mut guard = Self::lock(&self.shards[idx]);
         let ShardInner {
             ranges,
             range_by_txn,
@@ -827,6 +1506,9 @@ impl LockManager {
             let _ = ranges.remove(&space);
         }
         Self::forget_range(range_by_txn, txn, space, range);
+        if !guard.holds_any(txn) {
+            self.forget_shard(txn, idx);
+        }
         Ok(())
     }
 
@@ -908,10 +1590,16 @@ impl LockManager {
     /// Maps a resource id to a shard index via Fibonacci hashing.
     #[inline]
     fn shard_index(&self, res: ResourceId) -> usize {
+        self.index_of(res.get())
+    }
+
+    /// Maps an id to a shard index via Fibonacci hashing.
+    #[inline]
+    fn index_of(&self, id: u64) -> usize {
         if self.bits == 0 {
             return 0;
         }
-        let hash = res.get().wrapping_mul(FIB_HASH);
+        let hash = id.wrapping_mul(FIB_HASH);
         // Take the top `bits` bits: the most-mixed end of a multiplicative hash.
         (hash >> (u64::BITS - self.bits)) as usize
     }
@@ -1544,6 +2232,462 @@ mod tests {
             Acquisition::Granted
         );
         assert_eq!(lm.waiting_count(), 0);
+    }
+
+    // ---- victim fencing ----
+
+    #[test]
+    fn test_victim_is_fenced_until_released_after_being_told() {
+        // T2 holds A and waits for B; T1 holds B and requests A. The victim is
+        // T2 (youngest), not the requester.
+        let lm = LockManager::with_shards(1);
+        let (a, b) = (ResourceId::new(1), ResourceId::new(2));
+        let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+        assert_eq!(lm.request(t2, a, LockMode::Exclusive), Acquisition::Granted);
+        assert_eq!(lm.request(t1, b, LockMode::Exclusive), Acquisition::Granted);
+        assert_eq!(lm.request(t2, b, LockMode::Exclusive), Acquisition::Waiting);
+        let d = match lm.request(t1, a, LockMode::Exclusive) {
+            Acquisition::Deadlock(d) => d,
+            other => panic!("expected deadlock, got {other:?}"),
+        };
+        assert_eq!(d.victim, t2);
+
+        // T1's thread aborts T2, then proceeds and commits.
+        assert_eq!(lm.release_all(t2), 1);
+        assert_eq!(lm.request(t1, a, LockMode::Exclusive), Acquisition::Granted);
+        assert_eq!(lm.release_all(t1), 2);
+
+        // T2's own thread retries: it must be told it was aborted, not handed
+        // a fresh lock while it believes it still holds A.
+        match lm.request(t2, b, LockMode::Exclusive) {
+            Acquisition::Deadlock(d) => assert_eq!(d.victim, t2),
+            other => panic!("victim was not fenced: {other:?}"),
+        }
+        assert_eq!(
+            lm.try_acquire(t2, b, LockMode::Shared),
+            Err(LockError::Aborted)
+        );
+        assert_eq!(
+            lm.try_acquire_range(t2, b, kr(0, 1), LockMode::Shared),
+            Err(LockError::Aborted)
+        );
+        assert!(lm.is_aborted(t2));
+        assert_eq!(lm.mode_held(t2, b), None);
+
+        // Once the victim rolls back and releases itself, the id is usable.
+        assert_eq!(lm.release_all(t2), 0);
+        assert!(!lm.is_aborted(t2));
+        assert_eq!(lm.request(t2, b, LockMode::Exclusive), Acquisition::Granted);
+    }
+
+    #[test]
+    fn test_release_by_other_thread_keeps_mark_until_victim_is_told() {
+        let lm = LockManager::with_shards(4);
+        let (a, b) = (ResourceId::new(1), ResourceId::new(2));
+        let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+        let _ = lm.request(t2, a, LockMode::Exclusive);
+        let _ = lm.request(t1, b, LockMode::Exclusive);
+        let _ = lm.request(t2, b, LockMode::Exclusive);
+        let Acquisition::Deadlock(d) = lm.request(t1, a, LockMode::Exclusive) else {
+            panic!("expected deadlock");
+        };
+        // Released by the requester's side: the mark survives, because the
+        // victim itself has not been told yet.
+        let _ = lm.release_all(d.victim);
+        assert_eq!(
+            lm.try_acquire(t2, ResourceId::new(9), LockMode::Shared),
+            Err(LockError::Aborted)
+        );
+        let _ = lm.release_all(t2);
+        lm.try_acquire(t2, ResourceId::new(9), LockMode::Shared)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_victim_that_gives_up_untold_does_not_leak_its_mark() {
+        // The requester releases the victim; the victim's thread then times
+        // out and releases itself without another call into the manager. The
+        // second release clears the mark.
+        let lm = LockManager::with_shards(4);
+        let (a, b) = (ResourceId::new(1), ResourceId::new(2));
+        let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+        let _ = lm.request(t2, a, LockMode::Exclusive);
+        let _ = lm.request(t1, b, LockMode::Exclusive);
+        let _ = lm.request(t2, b, LockMode::Exclusive);
+        let Acquisition::Deadlock(d) = lm.request(t1, a, LockMode::Exclusive) else {
+            panic!("expected deadlock");
+        };
+        assert_eq!(d.victim, t2);
+        let _ = lm.release_all(t2); // requester's thread
+        let _ = lm.release_all(t2); // victim's own thread, untold
+        assert_eq!(lm.lock_victims().len(), 0);
+        assert_eq!(lm.victim_count.load(super::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_requester_victim_is_cleared_by_its_own_release() {
+        let lm = LockManager::new();
+        let (a, b) = (ResourceId::new(1), ResourceId::new(2));
+        let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+        let _ = lm.request(t1, a, LockMode::Exclusive);
+        let _ = lm.request(t2, b, LockMode::Exclusive);
+        let _ = lm.request(t1, b, LockMode::Exclusive);
+        let Acquisition::Deadlock(d) = lm.request(t2, a, LockMode::Exclusive) else {
+            panic!("expected deadlock");
+        };
+        assert_eq!(d.victim, t2); // the requester itself: told directly
+        let _ = lm.release_all(t2);
+        assert!(!lm.is_aborted(t2));
+        assert_eq!(lm.request(t2, b, LockMode::Exclusive), Acquisition::Waiting);
+    }
+
+    #[test]
+    fn test_find_deadlock_marks_its_victim() {
+        let lm = LockManager::new();
+        let (a, b) = (ResourceId::new(1), ResourceId::new(2));
+        let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+        lm.try_acquire(t1, a, LockMode::Exclusive).unwrap();
+        lm.try_acquire(t2, b, LockMode::Exclusive).unwrap();
+        let _ = lm.request(t1, b, LockMode::Exclusive);
+        // The second wait is detected by `request` itself and marks T2; clear
+        // that so the periodic detector is the one that names the victim.
+        let Acquisition::Deadlock(d) = lm.request(t2, a, LockMode::Exclusive) else {
+            panic!("expected deadlock");
+        };
+        assert!(lm.is_aborted(d.victim));
+        let found = lm.find_deadlock().unwrap();
+        assert_eq!(found.victim, d.victim);
+        let _ = lm.release_all(found.victim);
+        assert!(lm.find_deadlock().is_none());
+    }
+
+    // ---- FIFO fairness ----
+
+    #[test]
+    fn test_waiting_writer_is_not_overtaken_by_new_readers() {
+        let lm = LockManager::with_shards(1);
+        let row = ResourceId::new(1);
+        let writer = TxnId::new(2);
+        assert_eq!(
+            lm.request(TxnId::new(1), row, LockMode::Shared),
+            Acquisition::Granted
+        );
+        assert_eq!(
+            lm.request(writer, row, LockMode::Exclusive),
+            Acquisition::Waiting
+        );
+        // A newer reader is compatible with the holder but not with the
+        // queued writer, so it queues behind it.
+        assert_eq!(
+            lm.request(TxnId::new(3), row, LockMode::Shared),
+            Acquisition::Waiting
+        );
+        let _ = lm.release_all(TxnId::new(1));
+        // The writer is first in line and gets the lock; the reader still waits.
+        assert_eq!(
+            lm.request(TxnId::new(3), row, LockMode::Shared),
+            Acquisition::Waiting
+        );
+        assert_eq!(
+            lm.request(writer, row, LockMode::Exclusive),
+            Acquisition::Granted
+        );
+        let _ = lm.release_all(writer);
+        assert_eq!(
+            lm.request(TxnId::new(3), row, LockMode::Shared),
+            Acquisition::Granted
+        );
+        assert_eq!(lm.waiting_count(), 0);
+    }
+
+    #[test]
+    fn test_compatible_newcomer_passes_compatible_waiter() {
+        // Queue holds an IX waiter blocked by an S holder; a new IS is
+        // compatible with both, so it is granted (no needless blocking).
+        let lm = LockManager::with_shards(1);
+        let table = ResourceId::new(1);
+        let _ = lm.request(TxnId::new(1), table, LockMode::Shared);
+        assert_eq!(
+            lm.request(TxnId::new(2), table, LockMode::IntentionExclusive),
+            Acquisition::Waiting
+        );
+        assert_eq!(
+            lm.request(TxnId::new(3), table, LockMode::IntentionShared),
+            Acquisition::Granted
+        );
+    }
+
+    #[test]
+    fn test_upgrader_goes_ahead_of_queued_newcomers() {
+        let lm = LockManager::with_shards(1);
+        let row = ResourceId::new(1);
+        let (t1, t2, t3) = (TxnId::new(1), TxnId::new(2), TxnId::new(3));
+        let _ = lm.request(t1, row, LockMode::Shared);
+        let _ = lm.request(t2, row, LockMode::Shared);
+        // T3 queues for X behind both readers.
+        assert_eq!(
+            lm.request(t3, row, LockMode::Exclusive),
+            Acquisition::Waiting
+        );
+        // T1 upgrades: blocked by T2's S, queued ahead of T3.
+        assert_eq!(
+            lm.request(t1, row, LockMode::Exclusive),
+            Acquisition::Waiting
+        );
+        let _ = lm.release_all(t2);
+        // T3 arrived first but T1 is an upgrader at the head.
+        assert_eq!(
+            lm.request(t3, row, LockMode::Exclusive),
+            Acquisition::Waiting
+        );
+        assert_eq!(
+            lm.request(t1, row, LockMode::Exclusive),
+            Acquisition::Granted
+        );
+        assert_eq!(lm.mode_held(t1, row), Some(LockMode::Exclusive));
+    }
+
+    #[test]
+    fn test_queue_edge_closes_a_deadlock() {
+        // T1 holds S on R; T2 queues for X on R (waits for T1); T3 holds A and
+        // asks S on R, which queues behind T2 (waits for T2); T1 then waits for
+        // A (held by T3). The cycle T1 -> T3 -> T2 -> T1 runs through a queue
+        // edge, not only holder edges.
+        let lm = LockManager::with_shards(4);
+        let (r, a) = (ResourceId::new(1), ResourceId::new(2));
+        let (t1, t2, t3) = (TxnId::new(1), TxnId::new(2), TxnId::new(3));
+        let _ = lm.request(t1, r, LockMode::Shared);
+        let _ = lm.request(t3, a, LockMode::Exclusive);
+        assert_eq!(lm.request(t2, r, LockMode::Exclusive), Acquisition::Waiting);
+        assert_eq!(lm.request(t3, r, LockMode::Shared), Acquisition::Waiting);
+        match lm.request(t1, a, LockMode::Exclusive) {
+            Acquisition::Deadlock(d) => assert_eq!(d.cycle.len(), 3),
+            other => panic!("expected deadlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_two_upgraders_to_six_deadlock() {
+        // T1 and T2 both hold S on R. T1 asks IX (S join IX = SIX, blocked by
+        // T2's S). T2 asks IX too: each waits for the other.
+        let lm = LockManager::new();
+        let r = ResourceId::new(1);
+        let (t1, t2) = (TxnId::new(1), TxnId::new(2));
+        let _ = lm.request(t1, r, LockMode::Shared);
+        let _ = lm.request(t2, r, LockMode::Shared);
+        assert_eq!(
+            lm.request(t1, r, LockMode::IntentionExclusive),
+            Acquisition::Waiting
+        );
+        assert!(matches!(
+            lm.request(t2, r, LockMode::IntentionExclusive),
+            Acquisition::Deadlock(_)
+        ));
+    }
+
+    #[test]
+    fn test_request_on_new_resource_leaves_old_queue() {
+        let lm = LockManager::with_shards(4);
+        let (r1, r2) = (ResourceId::new(1), ResourceId::new(2));
+        let _ = lm.request(TxnId::new(1), r1, LockMode::Exclusive);
+        assert_eq!(
+            lm.request(TxnId::new(2), r1, LockMode::Exclusive),
+            Acquisition::Waiting
+        );
+        // T2 moves on to r2 and gets it; it no longer blocks r1's queue.
+        assert_eq!(
+            lm.request(TxnId::new(2), r2, LockMode::Exclusive),
+            Acquisition::Granted
+        );
+        let _ = lm.release_all(TxnId::new(1));
+        assert_eq!(
+            lm.request(TxnId::new(3), r1, LockMode::Exclusive),
+            Acquisition::Granted
+        );
+        assert_eq!(lm.waiting_count(), 0);
+    }
+
+    #[test]
+    fn test_cancel_wait_unblocks_queue() {
+        let lm = LockManager::with_shards(1);
+        let r = ResourceId::new(1);
+        let _ = lm.request(TxnId::new(1), r, LockMode::Shared);
+        let _ = lm.request(TxnId::new(2), r, LockMode::Exclusive);
+        assert_eq!(
+            lm.request(TxnId::new(3), r, LockMode::Shared),
+            Acquisition::Waiting
+        );
+        lm.cancel_wait(TxnId::new(2));
+        assert_eq!(
+            lm.request(TxnId::new(3), r, LockMode::Shared),
+            Acquisition::Granted
+        );
+    }
+
+    // ---- detection cost ----
+
+    #[test]
+    fn test_long_acyclic_chain_detection_is_linear() {
+        // An acyclic wait chain of 20,000 transactions. The 1.0.0 detector
+        // restarted its search from every waiter (quadratic: minutes here);
+        // a shared visited set makes it linear.
+        let lm = LockManager::new();
+        let n = 20_000u64;
+        for i in 0..=n {
+            assert_eq!(
+                lm.request(TxnId::new(i + 1), ResourceId::new(i), LockMode::Exclusive),
+                Acquisition::Granted
+            );
+        }
+        // T(i+1) holds R(i) and waits for R(i+1), held by T(i+2). Linked from
+        // the head, so each new wait walks one edge to a holder not yet waiting.
+        for i in 0..n {
+            assert_eq!(
+                lm.request(
+                    TxnId::new(i + 1),
+                    ResourceId::new(i + 1),
+                    LockMode::Exclusive
+                ),
+                Acquisition::Waiting
+            );
+        }
+        let start = std::time::Instant::now();
+        assert!(lm.find_deadlock().is_none());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "find_deadlock took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn test_wait_set_is_not_rebuilt_per_request() {
+        // 5,000 unrelated waiters. Each new conflicting request must cost the
+        // same as with none: 1.0.0 rebuilt the whole graph on every call.
+        let lm = LockManager::new();
+        for i in 0..5_000u64 {
+            let res = ResourceId::new(1_000_000 + i);
+            let _ = lm.request(TxnId::new(10_000_000 + i), res, LockMode::Exclusive);
+            let _ = lm.request(TxnId::new(i + 1), res, LockMode::Exclusive);
+        }
+        let hot = ResourceId::new(42);
+        let _ = lm.request(TxnId::new(99_999_999), hot, LockMode::Exclusive);
+        let start = std::time::Instant::now();
+        for j in 0..2_000u64 {
+            let who = TxnId::new(50_000_000 + j);
+            assert_eq!(lm.request(who, hot, LockMode::Shared), Acquisition::Waiting);
+            lm.cancel_wait(who);
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "2,000 requests took {:?}",
+            start.elapsed()
+        );
+    }
+
+    // ---- bookkeeping ----
+
+    #[test]
+    fn test_release_all_visits_only_touched_shards() {
+        let lm = LockManager::with_shards(1024);
+        let t = TxnId::new(7);
+        let r = ResourceId::new(5);
+        lm.try_acquire(t, r, LockMode::Exclusive).unwrap();
+        let idx = lm.shard_index(r);
+        {
+            let txns = lm.lock_txns(t);
+            let entry = txns.get(&t).unwrap();
+            let mut seen = Vec::new();
+            entry.shards.for_each(|i| seen.push(i));
+            assert_eq!(seen, vec![idx]);
+        }
+        assert_eq!(lm.release_all(t), 1);
+        assert!(lm.lock_txns(t).get(&t).is_none());
+    }
+
+    #[test]
+    fn test_shard_set_spills_and_tracks_every_shard() {
+        let mut set = super::ShardSet::default();
+        for i in [3, 900, 3, 17, 64, 5, 1023, 17] {
+            set.insert(i);
+        }
+        let mut seen = Vec::new();
+        set.for_each(|i| seen.push(i));
+        seen.sort_unstable();
+        assert_eq!(seen, vec![3, 5, 17, 64, 900, 1023]);
+        for i in [3, 5, 17, 64, 900, 1023] {
+            set.remove(i);
+        }
+        assert!(set.is_empty());
+
+        // Through the manager: locks in many shards are all released.
+        let lm = LockManager::with_shards(1024);
+        let t = TxnId::new(1);
+        for id in 0..200 {
+            lm.try_acquire(t, ResourceId::new(id), LockMode::Exclusive)
+                .unwrap();
+        }
+        assert_eq!(lm.release_all(t), 200);
+        for id in 0..200 {
+            assert_eq!(lm.holder_count(ResourceId::new(id)), 0);
+        }
+    }
+
+    #[test]
+    fn test_single_releases_leave_no_bookkeeping() {
+        let lm = LockManager::with_shards(8);
+        for i in 0..1_000u64 {
+            let t = TxnId::new(i);
+            lm.try_acquire(t, ResourceId::new(i), LockMode::Exclusive)
+                .unwrap();
+            lm.try_acquire_range(t, ResourceId::new(i + 7), kr(0, 1), LockMode::Shared)
+                .unwrap();
+            lm.release(t, ResourceId::new(i)).unwrap();
+            lm.release_range(t, ResourceId::new(i + 7), kr(0, 1))
+                .unwrap();
+        }
+        let left: usize = lm.txns.iter().map(|s| LockManager::lock_map(s).len()).sum();
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn test_range_reacquire_is_idempotent() {
+        let lm = LockManager::with_shards(1);
+        let space = ResourceId::new(7);
+        let t = TxnId::new(1);
+        for _ in 0..10_000 {
+            lm.try_acquire_range(t, space, kr(10, 20), LockMode::Shared)
+                .unwrap();
+        }
+        assert_eq!(lm.range_count(space), 1);
+        // A sub-range in a covered mode adds nothing either.
+        lm.try_acquire_range(t, space, kr(12, 15), LockMode::IntentionShared)
+            .unwrap();
+        assert_eq!(lm.range_count(space), 1);
+        // The same range in a stronger mode upgrades in place.
+        lm.try_acquire_range(t, space, kr(10, 20), LockMode::Exclusive)
+            .unwrap();
+        assert_eq!(lm.range_count(space), 1);
+        assert_eq!(
+            lm.try_acquire_range(TxnId::new(2), space, kr(15, 15), LockMode::Shared),
+            Err(LockError::Conflict)
+        );
+        assert_eq!(lm.release_all(t), 1);
+    }
+
+    #[test]
+    fn test_range_upgrade_blocked_by_other_reader() {
+        let lm = LockManager::with_shards(1);
+        let space = ResourceId::new(7);
+        lm.try_acquire_range(TxnId::new(1), space, kr(0, 9), LockMode::Shared)
+            .unwrap();
+        lm.try_acquire_range(TxnId::new(2), space, kr(5, 5), LockMode::Shared)
+            .unwrap();
+        assert_eq!(
+            lm.try_acquire_range(TxnId::new(1), space, kr(0, 9), LockMode::Exclusive),
+            Err(LockError::Conflict)
+        );
+        assert_eq!(lm.range_count(space), 2);
     }
 
     #[test]

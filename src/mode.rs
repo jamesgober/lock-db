@@ -40,6 +40,24 @@
 /// assert!(LockMode::IntentionShared.compatible_with(LockMode::SharedIntentionExclusive));
 /// assert!(!LockMode::IntentionShared.compatible_with(LockMode::Exclusive));
 /// ```
+///
+/// # Ordering
+///
+/// `LockMode` implements [`Ord`] so it can be a key in ordered collections. That
+/// order (IS < IX < S < SIX < X) is declaration order, not the privilege
+/// lattice: IX and S are incomparable in the lattice, yet `max(IX, S)` is `S`,
+/// which does not cover IX. Combine modes with [`join`](LockMode::join) and
+/// compare privilege with [`covers`](LockMode::covers), never with `max` or `<`.
+///
+/// ```
+/// use lock_db::LockMode;
+///
+/// assert_eq!(LockMode::IntentionExclusive.max(LockMode::Shared), LockMode::Shared);
+/// assert_eq!(
+///     LockMode::IntentionExclusive.join(LockMode::Shared),
+///     LockMode::SharedIntentionExclusive,
+/// );
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum LockMode {

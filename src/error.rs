@@ -48,6 +48,17 @@ pub enum LockError {
     /// signals a double release or a bookkeeping bug in the caller's
     /// transaction layer.
     NotHeld,
+
+    /// The transaction was chosen as a deadlock victim and must abort.
+    ///
+    /// Returned by [`try_acquire`](crate::LockManager::try_acquire) and
+    /// [`try_acquire_range`](crate::LockManager::try_acquire_range) for a
+    /// transaction that a deadlock check named as its victim and that has not
+    /// been released since. The transaction must roll back and call
+    /// [`release_all`](crate::LockManager::release_all) on itself; until then
+    /// every acquisition for it is refused, so it cannot carry on with a lock
+    /// set it has already lost.
+    Aborted,
 }
 
 impl fmt::Display for LockError {
@@ -55,6 +66,9 @@ impl fmt::Display for LockError {
         match self {
             Self::Conflict => f.write_str("lock request conflicts with an existing lock"),
             Self::NotHeld => f.write_str("no lock held for this transaction and resource"),
+            Self::Aborted => {
+                f.write_str("transaction was chosen as a deadlock victim and must abort")
+            }
         }
     }
 }
@@ -72,9 +86,13 @@ mod tests {
     fn test_display_messages_are_distinct_and_nonempty() {
         let conflict = LockError::Conflict.to_string();
         let not_held = LockError::NotHeld.to_string();
+        let aborted = LockError::Aborted.to_string();
         assert!(!conflict.is_empty());
         assert!(!not_held.is_empty());
+        assert!(!aborted.is_empty());
         assert_ne!(conflict, not_held);
+        assert_ne!(aborted, conflict);
+        assert_ne!(aborted, not_held);
     }
 
     #[test]
